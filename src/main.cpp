@@ -3,6 +3,10 @@
 #include <SDL_video.h>
 #include <SDL_events.h>
 
+#include <imgui_internal.h>
+#include <backends/imgui_impl_sdl2.cpp>
+#include <backends/imgui_impl_vulkan.cpp>
+
 vk::DispatchLoaderDynamic vk::defaultDispatchLoaderDynamic;
 
 struct RasterizerPushConstants {
@@ -16,9 +20,256 @@ struct Vertex {
     float x, y;
 };
 
+struct ImGuiRenderer {
+    VulkanRenderer* vulkan;
+
+    GpuTexture texture;
+
+    vk::DescriptorSetLayout bind_group_layout;
+    GpuGraphicsPipelineState graphics_pipeline_state;
+
+    ImGuiRenderer(VulkanRenderer* vulkan, void* window) : vulkan(vulkan) {
+        ImGui::CreateContext();
+
+        ImGui_ImplSDL2_InitForVulkan(static_cast<SDL_Window*>(window));
+
+        CreateFontTexture();
+        CreateDeviceObjects();
+    }
+
+    ~ImGuiRenderer() {
+        vulkan->context.logical_device.destroyDescriptorSetLayout(bind_group_layout);
+
+        vulkan->DestroyTexture(&texture);
+
+        gpu_destroy_graphics_pipeline_state(&vulkan->context, &graphics_pipeline_state);
+
+        ImGui_ImplSDL2_Shutdown();
+        ImGui::DestroyContext();
+    }
+
+    void CreateFontTexture() {
+        auto& io = ImGui::GetIO();
+
+        u8* pixels;
+        i32 width, height;
+        io.Fonts->GetTexDataAsRGBA32(&pixels, &width, &height);
+
+        vulkan->CreateTextureFromMemory(&texture, width, height, pixels);
+
+        io.Fonts->SetTexID(&texture);
+    }
+
+    void CreateDeviceObjects() {
+        auto vertex_shader_module = vulkan->context.logical_device.createShaderModule(vk::ShaderModuleCreateInfo({}, __glsl_shader_vert_spv));
+        auto fragment_shader_module = vulkan->context.logical_device.createShaderModule(vk::ShaderModuleCreateInfo({}, __glsl_shader_frag_spv));
+
+        auto entries = std::array{
+            vk::DescriptorSetLayoutBinding(0, vk::DescriptorType::eCombinedImageSampler, 1, vk::ShaderStageFlagBits::eFragment)
+        };
+
+        bind_group_layout = vulkan->context.logical_device.createDescriptorSetLayout(vk::DescriptorSetLayoutCreateInfo({}, entries));
+
+        auto bindings = std::array{
+            vk::VertexInputBindingDescription(0, sizeof(ImDrawVert), vk::VertexInputRate::eVertex)
+        };
+        auto attributes = std::array{
+            vk::VertexInputAttributeDescription(0, 0, vk::Format::eR32G32Sfloat, offsetof(ImDrawVert, pos)),
+            vk::VertexInputAttributeDescription(1, 0, vk::Format::eR32G32Sfloat, offsetof(ImDrawVert, uv)),
+            vk::VertexInputAttributeDescription(2, 0, vk::Format::eR8G8B8A8Unorm, offsetof(ImDrawVert, col)),
+        };
+
+        auto color_blend_attachments = std::array{
+            vk::PipelineColorBlendAttachmentState()
+                .setBlendEnable(VK_TRUE)
+                .setSrcColorBlendFactor(vk::BlendFactor::eSrcAlpha)
+                .setDstColorBlendFactor(vk::BlendFactor::eOneMinusSrcAlpha)
+                .setColorBlendOp(vk::BlendOp::eAdd)
+                .setSrcAlphaBlendFactor(vk::BlendFactor::eOne)
+                .setDstAlphaBlendFactor(vk::BlendFactor::eOneMinusSrcAlpha)
+                .setAlphaBlendOp(vk::BlendOp::eAdd)
+                .setColorWriteMask(vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG | vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA)
+        };
+
+        auto bind_group_layouts = std::array{
+            bind_group_layout
+        };
+
+        auto push_constant_ranges = std::array{
+            vk::PushConstantRange(vk::ShaderStageFlagBits::eVertex, 0, sizeof(f32[4]))
+        };
+
+        auto state_create_info = GpuGraphicsPipelineStateCreateInfo{
+            .vertex_shader_module = vertex_shader_module,
+            .vertex_shader_entry_point = "main",
+            .fragment_shader_module = fragment_shader_module,
+            .fragment_shader_entry_point = "main",
+            .rasterization_state = {
+                .cull_mode = vk::CullModeFlagBits::eNone
+            },
+            .depth_stencil_state = {
+                .depth_test_enable = false,
+                .depth_write_enable = false,
+            },
+            .color_blend_state = {
+                .logic_op_enable = VK_FALSE,
+                .attachments = color_blend_attachments
+            },
+            .vertex_input_state = {
+                .bindings = bindings,
+                .attributes = attributes
+            },
+            .bind_group_layouts = bind_group_layouts,
+            .push_constant_ranges = push_constant_ranges,
+            .render_pass = vulkan->swapchain_render_pass,
+        };
+
+        gpu_create_graphics_pipeline_state(&vulkan->context, &graphics_pipeline_state, &state_create_info, nullptr);
+
+        vulkan->context.logical_device.destroyShaderModule(vertex_shader_module);
+        vulkan->context.logical_device.destroyShaderModule(fragment_shader_module);
+    }
+
+    void RenderDrawData(vk::CommandBuffer command_buffer, ImDrawData* draw_data) {
+//    ImGui_ImplVulkan_RenderDrawData(draw_data, command_buffer, pipeline.pipeline);
+        auto fb_width = static_cast<i32>(draw_data->DisplaySize.x * draw_data->FramebufferScale.x);
+        auto fb_height = static_cast<i32>(draw_data->DisplaySize.y * draw_data->FramebufferScale.y);
+        if (fb_width <= 0 || fb_height <= 0) {
+            return;
+        }
+
+        GpuBufferInfo ia = {};
+        GpuBufferInfo va = {};
+
+        if (draw_data->TotalVtxCount > 0) {
+            // Create or resize the vertex/index buffers
+            if (!vulkan->AllocateTemporary(&ia, draw_data->TotalVtxCount * sizeof(ImDrawVert), alignof(ImDrawVert))) {
+                fprintf(stderr, "Failed to allocate vertex buffer for ImGui\n");
+                return;
+            }
+            if (!vulkan->AllocateTemporary(&va, draw_data->TotalIdxCount * sizeof(ImDrawIdx), alignof(ImDrawIdx))) {
+                fprintf(stderr, "Failed to allocate index buffer for ImGui\n");
+                return;
+            }
+
+            // Upload vertex/index data into a single contiguous GPU buffer
+            auto* vtx_dst = static_cast<ImDrawVert*>(va.mapped);
+            auto* idx_dst = static_cast<ImDrawIdx*>(ia.mapped);
+            for (auto cmd_list : std::span(draw_data->CmdLists, draw_data->CmdListsCount)) {
+                std::memcpy(vtx_dst, cmd_list->VtxBuffer.Data, cmd_list->VtxBuffer.Size * sizeof(ImDrawVert));
+                std::memcpy(idx_dst, cmd_list->IdxBuffer.Data, cmd_list->IdxBuffer.Size * sizeof(ImDrawIdx));
+                vtx_dst += cmd_list->VtxBuffer.Size;
+                idx_dst += cmd_list->IdxBuffer.Size;
+            }
+        }
+
+        SetupRenderState(command_buffer, draw_data, &va, &ia, fb_width, fb_height);
+
+        auto clip_off = draw_data->DisplayPos;
+        auto clip_scale = draw_data->FramebufferScale;
+
+        i32 global_vtx_offset = 0;
+        i32 global_idx_offset = 0;
+        for (auto cmd_list : std::span(draw_data->CmdLists, draw_data->CmdListsCount)) {
+            for (auto& draw_cmd : std::span(cmd_list->CmdBuffer.Data, cmd_list->CmdBuffer.Size)) {
+                if (draw_cmd.UserCallback != nullptr) {
+                    if (draw_cmd.UserCallback == ImDrawCallback_ResetRenderState) {
+                        SetupRenderState(command_buffer, draw_data, &va, &ia, fb_width, fb_height);
+                    } else {
+                        draw_cmd.UserCallback(cmd_list, &draw_cmd);
+                    }
+                    continue;
+                }
+
+                auto clip_rect = ImRect(
+                    (ImVec2(draw_cmd.ClipRect.x, draw_cmd.ClipRect.y) - clip_off) * clip_scale,
+                    (ImVec2(draw_cmd.ClipRect.z, draw_cmd.ClipRect.w) - clip_off) * clip_scale
+                );
+                clip_rect.ClipWith(ImRect(0, 0, static_cast<f32>(fb_width), static_cast<f32>(fb_height)));
+
+                if (clip_rect.Min.x >= clip_rect.Max.x || clip_rect.Min.y >= clip_rect.Max.y) {
+                    continue;
+                }
+
+                auto scissor = vk::Rect2D{
+                    vk::Offset2D{
+                        static_cast<i32>(clip_rect.Min.x),
+                        static_cast<i32>(clip_rect.Min.y),
+                    },
+                    vk::Extent2D{
+                        static_cast<u32>(clip_rect.GetWidth()),
+                        static_cast<u32>(clip_rect.GetHeight())
+                    }
+                };
+                command_buffer.setScissor(0, 1, &scissor);
+
+                vk::DescriptorSet bind_group;
+                {
+                    auto allocate_info = vk::DescriptorSetAllocateInfo()
+                        .setDescriptorPool(vulkan->context.bind_group_allocators[vulkan->frame_index])
+                        .setDescriptorSetCount(1)
+                        .setPSetLayouts(&bind_group_layout);
+
+                    auto result = vulkan->context.logical_device.allocateDescriptorSets(&allocate_info, &bind_group);
+                    if (result != vk::Result::eSuccess) {
+                        fprintf(stderr, "Failed to allocate descriptor set for ImGui\n");
+                        return;
+                    }
+
+                    auto p_texture = static_cast<GpuTexture*>(draw_cmd.TextureId);
+
+                    auto image_info = vk::DescriptorImageInfo()
+                        .setSampler(p_texture->sampler)
+                        .setImageView(p_texture->view)
+                        .setImageLayout(vk::ImageLayout::eShaderReadOnlyOptimal);
+
+                    auto writes = std::array{
+                        vk::WriteDescriptorSet()
+                            .setDstSet(bind_group)
+                            .setDstBinding(0)
+                            .setDstArrayElement(0)
+                            .setDescriptorType(vk::DescriptorType::eCombinedImageSampler)
+                            .setDescriptorCount(1)
+                            .setPImageInfo(&image_info),
+                    };
+
+                    vulkan->context.logical_device.updateDescriptorSets(writes, nullptr);
+                }
+
+                command_buffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, graphics_pipeline_state.pipeline_layout, 0, 1, &bind_group, 0, nullptr);
+                command_buffer.drawIndexed(draw_cmd.ElemCount, 1, draw_cmd.IdxOffset + global_idx_offset, static_cast<i32>(draw_cmd.VtxOffset + global_vtx_offset), 0);
+            }
+            global_idx_offset += cmd_list->IdxBuffer.Size;
+            global_vtx_offset += cmd_list->VtxBuffer.Size;
+        }
+    }
+
+    void SetupRenderState(vk::CommandBuffer command_buffer, ImDrawData* draw_data, GpuBufferInfo* va, GpuBufferInfo* ia, int fb_width, int fb_height) {
+        command_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, graphics_pipeline_state.pipeline);
+
+        if (draw_data->TotalVtxCount > 0) {
+            command_buffer.bindVertexBuffers(0, 1, &va->buffer, &va->offset);
+            command_buffer.bindIndexBuffer(ia->buffer, ia->offset, sizeof(ImDrawIdx) == 2 ? vk::IndexType::eUint16 : vk::IndexType::eUint32);
+        }
+
+        auto viewport = vk::Viewport(0, 0, static_cast<f32>(fb_width), static_cast<f32>(fb_height), 0.0f, 1.0f);
+        command_buffer.setViewport(0, 1, &viewport);
+
+        float scale[2];
+        scale[0] = 2.0f / draw_data->DisplaySize.x;
+        scale[1] = 2.0f / draw_data->DisplaySize.y;
+        float translate[2];
+        translate[0] = -1.0f - draw_data->DisplayPos.x * scale[0];
+        translate[1] = -1.0f - draw_data->DisplayPos.y * scale[1];
+        command_buffer.pushConstants(graphics_pipeline_state.pipeline_layout, vk::ShaderStageFlagBits::eVertex, sizeof(float) * 0, sizeof(float) * 2, scale);
+        command_buffer.pushConstants(graphics_pipeline_state.pipeline_layout, vk::ShaderStageFlagBits::eVertex, sizeof(float) * 2, sizeof(float) * 2, translate);
+    }
+};
+
 struct App {
     SDL_Window* window;
-    Vulkan* vulkan;
+    VulkanRenderer* vulkan;
+    ImGuiRenderer* imgui;
 
     vk::DescriptorSetLayout compute_bind_group_layout;
     GpuComputePipelineState compute_pipeline_state;
@@ -30,7 +281,8 @@ struct App {
 
     App() {
         window = SDL_CreateWindow("Hello, world!", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 800, 600, SDL_WINDOW_VULKAN | SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_RESIZABLE);
-        vulkan = new Vulkan(window);
+        vulkan = new VulkanRenderer(window);
+        imgui = new ImGuiRenderer(vulkan, window);
 
         CreateComputePipelineState();
         CreateGraphicsPipelineState();
@@ -63,12 +315,23 @@ struct App {
         vulkan->context.logical_device.destroyDescriptorSetLayout(compute_bind_group_layout);
         vulkan->context.logical_device.destroyDescriptorSetLayout(graphics_bind_group_layout);
 
+        delete imgui;
         delete vulkan;
+
         SDL_DestroyWindow(window);
     }
 
     void Start() {
         while (PumpEvents()) {
+            ImGui_ImplSDL2_NewFrame();
+            ImGui::NewFrame();
+
+            ImGui::Begin("Debug");
+            ImGui::Text("Application average %.3f ms/frame (%.1f FPS)", 1000.0f / ImGui::GetIO().Framerate, ImGui::GetIO().Framerate);
+            ImGui::End();
+
+            ImGui::Render();
+
             vulkan->WaitAndBeginNewFrame();
             {
                 auto cmd = vulkan->context.command_buffers[vulkan->frame_index];
@@ -115,7 +378,11 @@ struct App {
                             .setDescriptorSetCount(1)
                             .setPSetLayouts(&compute_bind_group_layout);
 
-                        vulkan->context.logical_device.allocateDescriptorSets(&allocate_info, &bind_group);
+                        auto result = vulkan->context.logical_device.allocateDescriptorSets(&allocate_info, &bind_group);
+                        if (result != vk::Result::eSuccess) {
+                            fprintf(stderr, "Failed to allocate descriptor set %s\n", vk::to_string(result).c_str());
+                            exit(1);
+                        }
 
                         auto color_image_info = vk::DescriptorImageInfo()
                             .setImageView(vulkan->color_textures[vulkan->image_index].view)
@@ -205,7 +472,11 @@ struct App {
                         .setDescriptorSetCount(1)
                         .setPSetLayouts(&graphics_bind_group_layout);
 
-                    vulkan->context.logical_device.allocateDescriptorSets(&allocate_info, &bind_group);
+                    auto result = vulkan->context.logical_device.allocateDescriptorSets(&allocate_info, &bind_group);
+                    if (result != vk::Result::eSuccess) {
+                        fprintf(stderr, "Failed to allocate descriptor set %s\n", vk::to_string(result).c_str());
+                        exit(1);
+                    }
 
                     auto image_info = vk::DescriptorImageInfo()
                         .setSampler(sampler)
@@ -227,6 +498,9 @@ struct App {
                 cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, graphics_pipeline_state.pipeline_layout, 0, 1, &bind_group, 0, nullptr);
 
                 cmd.draw(6, 1, 0, 0);
+
+                imgui->RenderDrawData(cmd, ImGui::GetDrawData());
+
                 cmd.endRenderPass();
             }
             vulkan->SubmitFrameAndPresent();
@@ -239,6 +513,8 @@ struct App {
     auto PumpEvents() -> bool {
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
+            ImGui_ImplSDL2_ProcessEvent(&event);
+
             if (event.type == SDL_QUIT) {
                 return false;
             }
@@ -316,7 +592,7 @@ struct App {
             .push_constant_ranges        = {},
             .render_pass                 = vulkan->swapchain_render_pass,
         };
-        gpu_create_graphics_pipeline_state(&vulkan->context, &graphics_pipeline_state, &state_create_info);
+        gpu_create_graphics_pipeline_state(&vulkan->context, &graphics_pipeline_state, &state_create_info, nullptr);
 
         vulkan->context.logical_device.destroyShaderModule(vertex_shader_module);
         vulkan->context.logical_device.destroyShaderModule(fragment_shader_module);

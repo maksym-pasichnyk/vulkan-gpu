@@ -17,7 +17,7 @@ struct SurfaceConfiguration {
     u32                 min_image_count = {};
 };
 
-struct Vulkan {
+struct VulkanRenderer {
     vk::DynamicLoader                           loader;
     GpuContext                                  context;
 
@@ -35,7 +35,7 @@ struct Vulkan {
     u32                                         image_index = 0;
     usize                                       frame_index = 0;
 
-    Vulkan(SDL_Window* window) {
+    VulkanRenderer(SDL_Window* window) {
         gpu_create_context(&context, window, loader.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr"));
 
         configuration.format = vk::Format::eB8G8R8A8Unorm;
@@ -93,7 +93,7 @@ struct Vulkan {
         ConfigureSwapchain();
     }
 
-    ~Vulkan() {
+    ~VulkanRenderer() {
         CleanupSwapchain();
 
         context.logical_device.destroyRenderPass(swapchain_render_pass);
@@ -243,6 +243,7 @@ struct Vulkan {
 
         gpu_allocator_reset(&context.frame_allocators[frame_index]);
 
+        context.logical_device.resetDescriptorPool(context.bind_group_allocators[frame_index]);
         context.command_buffers[frame_index].begin(vk::CommandBufferBeginInfo(vk::CommandBufferUsageFlagBits::eOneTimeSubmit));
     }
 
@@ -299,5 +300,156 @@ struct Vulkan {
             .setPCode(reinterpret_cast<const u32*>(code.data()));
 
         return context.logical_device.createShaderModule(create_info);
+    }
+
+    void CreateTextureFromMemory(GpuTexture* texture, u32 width, u32 height, void* pixels) {
+        auto color_image_create_info = vk::ImageCreateInfo()
+            .setImageType(vk::ImageType::e2D)
+            .setFormat(vk::Format::eR8G8B8A8Unorm)
+            .setExtent(vk::Extent3D(width, height, 1))
+            .setMipLevels(1)
+            .setArrayLayers(1)
+            .setSamples(vk::SampleCountFlagBits::e1)
+            .setTiling(vk::ImageTiling::eOptimal)
+            .setUsage(vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferDst)
+            .setSharingMode(vk::SharingMode::eExclusive)
+            .setQueueFamilyIndices({})
+            .setInitialLayout(vk::ImageLayout::eUndefined);
+
+        texture->image = context.logical_device.createImage(color_image_create_info);
+
+        gpu_allocate_memory(
+            &context,
+            &texture->allocation,
+            context.logical_device.getImageMemoryRequirements(texture->image),
+            vk::MemoryPropertyFlagBits::eDeviceLocal,
+            vk::MemoryAllocateFlagBits{}
+        );
+        context.logical_device.bindImageMemory(texture->image, texture->allocation.device_memory, 0);
+
+        auto color_view_create_info = vk::ImageViewCreateInfo()
+            .setImage(texture->image)
+            .setViewType(vk::ImageViewType::e2D)
+            .setFormat(vk::Format::eR8G8B8A8Unorm)
+            .setComponents(vk::ComponentMapping()
+                .setR(vk::ComponentSwizzle::eIdentity)
+                .setG(vk::ComponentSwizzle::eIdentity)
+                .setB(vk::ComponentSwizzle::eIdentity)
+                .setA(vk::ComponentSwizzle::eIdentity))
+            .setSubresourceRange(vk::ImageSubresourceRange()
+                .setAspectMask(vk::ImageAspectFlagBits::eColor)
+                .setBaseMipLevel(0)
+                .setLevelCount(1)
+                .setBaseArrayLayer(0)
+                .setLayerCount(1));
+
+        texture->view = context.logical_device.createImageView(color_view_create_info);
+
+        texture->sampler = context.logical_device.createSampler(vk::SamplerCreateInfo()
+            .setMagFilter(vk::Filter::eNearest)
+            .setMinFilter(vk::Filter::eNearest)
+            .setAddressModeU(vk::SamplerAddressMode::eClampToEdge)
+            .setAddressModeV(vk::SamplerAddressMode::eClampToEdge)
+            .setAddressModeW(vk::SamplerAddressMode::eClampToEdge)
+            .setAnisotropyEnable(false)
+            .setMaxAnisotropy(1.0f)
+            .setBorderColor(vk::BorderColor::eFloatOpaqueWhite)
+            .setUnnormalizedCoordinates(false)
+            .setCompareEnable(false)
+            .setCompareOp(vk::CompareOp::eAlways)
+            .setMipmapMode(vk::SamplerMipmapMode::eNearest)
+            .setMipLodBias(0.0f)
+            .setMinLod(0.0f)
+            .setMaxLod(0.0f)
+        );
+
+        {
+            auto size_in_bytes = static_cast<vk::DeviceSize>(width * height * 4);
+
+            auto buffer_create_info = vk::BufferCreateInfo()
+                .setSize(size_in_bytes)
+                .setUsage(vk::BufferUsageFlagBits::eTransferSrc)
+                .setSharingMode(vk::SharingMode::eExclusive)
+                .setQueueFamilyIndices({})
+                .setFlags(vk::BufferCreateFlagBits{});
+
+            auto tmp = context.logical_device.createBuffer(buffer_create_info);
+
+            GpuAllocation allocation;
+            gpu_allocate_memory(
+                &context,
+                &allocation,
+                context.logical_device.getBufferMemoryRequirements(tmp),
+                vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
+                vk::MemoryAllocateFlagBits{}
+            );
+
+            context.logical_device.bindBufferMemory(tmp, allocation.device_memory, 0);
+
+            std::memcpy(allocation.mapped, pixels, size_in_bytes);
+
+            auto cmd = context.command_buffers[0];
+            cmd.begin(vk::CommandBufferBeginInfo(vk::CommandBufferUsageFlagBits::eOneTimeSubmit));
+
+            {
+                auto barriers = std::array{
+                    vk::ImageMemoryBarrier2()
+                        .setSrcAccessMask(vk::AccessFlagBits2KHR::eHostWrite)
+                        .setDstAccessMask(vk::AccessFlagBits2KHR::eTransferWrite)
+                        .setSrcStageMask(vk::PipelineStageFlagBits2KHR::eHost)
+                        .setDstStageMask(vk::PipelineStageFlagBits2KHR::eTransfer)
+                        .setOldLayout(vk::ImageLayout::eUndefined)
+                        .setNewLayout(vk::ImageLayout::eTransferDstOptimal)
+                        .setSrcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                        .setDstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                        .setImage(texture->image)
+                        .setSubresourceRange(vk::ImageSubresourceRange(vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1)),
+                };
+                cmd.pipelineBarrier2(vk::DependencyInfo({}, {}, {}, barriers));
+            }
+
+            auto region = vk::BufferImageCopy()
+                .setImageSubresource(vk::ImageSubresourceLayers(vk::ImageAspectFlagBits::eColor, 0, 0, 1))
+                .setImageExtent(vk::Extent3D(width, height, 1));
+
+            cmd.copyBufferToImage(tmp, texture->image, vk::ImageLayout::eTransferDstOptimal, 1, &region);
+
+            {
+                auto barriers = std::array{
+                    vk::ImageMemoryBarrier2()
+                        .setSrcAccessMask(vk::AccessFlagBits2KHR::eTransferWrite)
+                        .setDstAccessMask(vk::AccessFlagBits2KHR::eShaderRead)
+                        .setSrcStageMask(vk::PipelineStageFlagBits2KHR::eTransfer)
+                        .setDstStageMask(vk::PipelineStageFlagBits2KHR::eFragmentShader)
+                        .setOldLayout(vk::ImageLayout::eTransferDstOptimal)
+                        .setNewLayout(vk::ImageLayout::eShaderReadOnlyOptimal)
+                        .setSrcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                        .setDstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                        .setImage(texture->image)
+                        .setSubresourceRange(vk::ImageSubresourceRange(vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1)),
+                };
+                cmd.pipelineBarrier2(vk::DependencyInfo({}, {}, {}, barriers));
+            }
+            cmd.end();
+
+            auto fence = context.logical_device.createFence(vk::FenceCreateInfo());
+            auto submit_info = vk::SubmitInfo(0, nullptr, nullptr, 1, &cmd, 0, nullptr);
+
+            context.graphics_queue.submit(1, &submit_info, fence);
+            context.logical_device.waitForFences(1, &fence, VK_TRUE, UINT64_MAX);
+            context.logical_device.destroyFence(fence);
+            context.logical_device.destroyBuffer(tmp);
+            gpu_free_memory(&context, &allocation);
+        }
+    }
+
+    void DestroyTexture(GpuTexture* texture) {
+        if (texture->sampler) {
+            context.logical_device.destroySampler(texture->sampler);
+        }
+        context.logical_device.destroyImageView(texture->view);
+        context.logical_device.destroyImage(texture->image);
+
+        gpu_free_memory(&context, &texture->allocation);
     }
 };

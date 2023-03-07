@@ -76,9 +76,10 @@ struct GpuBufferInfo {
 };
 
 struct GpuTexture {
-    vk::Image     image;
-    vk::ImageView view;
-    GpuAllocation allocation;
+    vk::Image     image         = {};
+    vk::ImageView view          = {};
+    vk::Sampler   sampler       = {};
+    GpuAllocation allocation    = {};
 };
 
 struct GpuGraphicsPipelineStateCreateInfo {
@@ -239,9 +240,7 @@ void gpu_create_allocator(GpuContext* context, GpuLinearAllocator* allocator, vk
     gpu_allocate_memory(context, &allocator->allocation, memory_requirements, memory_property_flags, memory_allocate_flags);
     context->logical_device.bindBufferMemory(allocator->buffer, allocator->allocation.device_memory, 0);
 
-    auto buffer_device_address_info = vk::BufferDeviceAddressInfo()
-        .setBuffer(allocator->buffer);
-
+    auto buffer_device_address_info = vk::BufferDeviceAddressInfo().setBuffer(allocator->buffer);
     allocator->device_address = context->logical_device.getBufferAddress(buffer_device_address_info);
 }
 
@@ -456,7 +455,7 @@ void gpu_allocator_reset(GpuLinearAllocator* allocator) {
     allocator->offset = 0;
 }
 
-void gpu_create_graphics_pipeline_state(GpuContext* context, GpuGraphicsPipelineState* state, GpuGraphicsPipelineStateCreateInfo* info) {
+void gpu_create_graphics_pipeline_state(GpuContext* context, GpuGraphicsPipelineState* state, GpuGraphicsPipelineStateCreateInfo* info, void* pNext) {
     auto shader_stages = std::array{
         vk::PipelineShaderStageCreateInfo()
             .setStage(vk::ShaderStageFlagBits::eVertex)
@@ -534,7 +533,7 @@ void gpu_create_graphics_pipeline_state(GpuContext* context, GpuGraphicsPipeline
     state->pipeline_layout = context->logical_device.createPipelineLayout(layout_create_info);
 
     auto graphics_pipeline_create_info = vk::GraphicsPipelineCreateInfo()
-        .setPNext(nullptr)
+        .setPNext(pNext)
         .setStages(shader_stages)
         .setPVertexInputState(&vertex_input_state_create_info)
         .setPInputAssemblyState(&input_assembly_state_create_info)
