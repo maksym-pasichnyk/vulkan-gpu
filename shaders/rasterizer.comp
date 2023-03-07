@@ -1,0 +1,61 @@
+#version 450
+
+#extension GL_ARB_gpu_shader_int64 : require
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_buffer_reference2 : enable
+#extension GL_EXT_scalar_block_layout : enable
+
+layout(binding = 0, rgba32f) uniform image2D ColorImage;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer IndexBufferReference {
+    uint element;
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer VertexBufferReference {
+    vec2 element;
+};
+
+layout(push_constant) uniform RasterizerPushConstants {
+    IndexBufferReference    index_buffer_reference;
+    VertexBufferReference   vertex_buffer_reference;
+    uvec2                   viwport_size;
+    uint                    index_count;
+} state;
+
+float area(vec2 v1, vec2 v2, vec2 v3) {
+    vec2 a = v2 - v1;
+    vec2 b = v3 - v1;
+    return a.x * b.y - b.x * a.y;
+}
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(ColorImage);
+
+    if (pixel.x >= size.x || pixel.y >= size.y) {
+        return;
+    }
+
+    imageStore(ColorImage, pixel, vec4(0, 0, 0, 0));
+
+    for (uint i = 0; i < state.index_count; i += 3) {
+        uint i0 = state.index_buffer_reference[i + 0].element;
+        uint i1 = state.index_buffer_reference[i + 1].element;
+        uint i2 = state.index_buffer_reference[i + 2].element;
+
+        vec2 p0 = vec2(pixel);
+        vec2 p1 = state.vertex_buffer_reference[i0].element;
+        vec2 p2 = state.vertex_buffer_reference[i1].element;
+        vec2 p3 = state.vertex_buffer_reference[i2].element;
+
+        float A0 = abs(area(p1, p2, p3));
+        float A1 = abs(area(p0, p2, p3));
+        float A2 = abs(area(p1, p0, p3));
+        float A3 = abs(area(p1, p2, p0));
+
+        if (A0 == A1 + A2 + A3) {
+            imageStore(ColorImage, pixel, vec4(1, 0, 0, 1));
+        }
+    }
+}
