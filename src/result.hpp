@@ -33,7 +33,7 @@ struct Result : Enum<T, E> {
     [[nodiscard]] auto value() const -> const T& {
         switch (Enum::index()) {
             case 0: return Enum::template as<T>();
-            case 1: throw auto(Enum::template as<E>());
+            case 1: throw E(Enum::template as<E>());
             default: unreachable();
         }
     }
@@ -41,7 +41,7 @@ struct Result : Enum<T, E> {
     [[nodiscard]] auto value() -> T& {
         switch (Enum::index()) {
             case 0: return Enum::template as<T>();
-            case 1: throw auto(Enum::template as<E>());
+            case 1: throw E(Enum::template as<E>());
             default: unreachable();
         }
     }

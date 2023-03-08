@@ -45,7 +45,7 @@ struct App {
     App() {
 //        window = SDL_CreateWindow("Hello, world!", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 800, 600, SDL_WINDOW_VULKAN | SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_RESIZABLE);
 
-        glfwInitVulkanLoader(vulkan->loader.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr"));
+        //glfwInitVulkanLoader(vulkan->loader.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr"));
         glfwInit();
         glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
         window = glfwCreateWindow(800, 600, "Vulkan window", nullptr, nullptr);
@@ -91,6 +91,7 @@ struct App {
     void Update() {
 //        ImGui_ImplSDL2_NewFrame();
         ImGui_ImplGlfw_NewFrame();
+
         ImGui::NewFrame();
 
         ImGui::Begin("Stats");
@@ -434,9 +435,14 @@ struct App {
 };
 
 auto main() -> i32 {
-    setenv("MVK_DEBUG", "1", 1);
+    // setenv("MVK_DEBUG", "1", 1);
 
-    auto app = App();
-    app.Start();
-    return 0;
+    try {
+        auto app = App();
+        app.Start();
+        return 0;
+    } catch(const std::exception& e) {
+        fprintf(stderr, "%s\n", e.what());
+        return 1;
+    }
 }

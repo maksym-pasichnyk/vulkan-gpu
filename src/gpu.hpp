@@ -241,16 +241,23 @@ void gpu_create_context(GpuContext* context, GLFWwindow* window, PFN_vkGetInstan
     vk::defaultDispatchLoaderDynamic.init(vk_get_instance_proc_addr);
 
     std::vector<const char*> instance_extensions;
-    instance_extensions.push_back("VK_KHR_surface");
+
+    u32 count;
+    const char** extensions = glfwGetRequiredInstanceExtensions(&count);
+    for (u32 i = 0; i < count; i++) {
+        instance_extensions.push_back(extensions[i]);
+    }
+
     instance_extensions.push_back("VK_EXT_debug_utils");
-    instance_extensions.push_back("VK_EXT_metal_surface");
     instance_extensions.push_back("VK_KHR_device_group_creation");
+#if __APPLE__
     instance_extensions.push_back("VK_KHR_portability_enumeration");
+#endif
     instance_extensions.push_back("VK_KHR_get_physical_device_properties2");
 
     std::vector<const char*> instance_layers;
-    instance_layers.push_back("VK_LAYER_KHRONOS_validation");
-    instance_layers.push_back("VK_LAYER_KHRONOS_synchronization2");
+    // instance_layers.push_back("VK_LAYER_KHRONOS_validation");
+    // instance_layers.push_back("VK_LAYER_KHRONOS_synchronization2");
 
     auto app_info = vk::ApplicationInfo()
         .setPApplicationName("Dragon")
@@ -328,7 +335,9 @@ void gpu_create_context(GpuContext* context, GLFWwindow* window, PFN_vkGetInstan
     device_extensions.push_back(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
     device_extensions.push_back(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME);
     device_extensions.push_back(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME);
+#if __APPLE__
     device_extensions.push_back(VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME);
+#endif
 
     auto device_create_info = vk::DeviceCreateInfo()
         .setPNext(&features2)
