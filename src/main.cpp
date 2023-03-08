@@ -1,10 +1,11 @@
 #include "VulkanRenderer.hpp"
 #include "ImGuiRenderer.hpp"
 
-#include <SDL_video.h>
-#include <SDL_events.h>
+//#include <SDL_video.h>
+//#include <SDL_events.h>
 #include <imgui_demo.cpp>
-#include <backends/imgui_impl_sdl2.cpp>
+#include <backends/imgui_impl_glfw.cpp>
+//#include <backends/imgui_impl_sdl2.cpp>
 
 vk::DispatchLoaderDynamic vk::defaultDispatchLoaderDynamic;
 
@@ -28,7 +29,8 @@ struct float4 {
 };
 
 struct App {
-    SDL_Window*     window;
+//    SDL_Window*     window;
+    GLFWwindow*     window;
     VulkanRenderer* vulkan;
     ImGuiRenderer*  imgui;
 
@@ -41,7 +43,12 @@ struct App {
     bool use_memcpy = false;
 
     App() {
-        window = SDL_CreateWindow("Hello, world!", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 800, 600, SDL_WINDOW_VULKAN | SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_RESIZABLE);
+//        window = SDL_CreateWindow("Hello, world!", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 800, 600, SDL_WINDOW_VULKAN | SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_RESIZABLE);
+
+        glfwInitVulkanLoader(vulkan->loader.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr"));
+        glfwInit();
+        glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
+        window = glfwCreateWindow(800, 600, "Vulkan window", nullptr, nullptr);
         vulkan = new VulkanRenderer(window);
         imgui = new ImGuiRenderer(vulkan, window);
 
@@ -59,7 +66,8 @@ struct App {
         delete imgui;
         delete vulkan;
 
-        SDL_DestroyWindow(window);
+        glfwDestroyWindow(window);
+//        SDL_DestroyWindow(window);
     }
 
     void Start() {
@@ -81,7 +89,8 @@ struct App {
     }
 
     void Update() {
-        ImGui_ImplSDL2_NewFrame();
+//        ImGui_ImplSDL2_NewFrame();
+        ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
         ImGui::Begin("Stats");
@@ -93,19 +102,22 @@ struct App {
     }
 
     auto PumpEvents() -> bool {
-        SDL_Event event;
-        while (SDL_PollEvent(&event)) {
-            ImGui_ImplSDL2_ProcessEvent(&event);
+        glfwPollEvents();
+        return !glfwWindowShouldClose(window);
 
-            if (event.type == SDL_QUIT) {
-                return false;
-            }
-            if (event.type == SDL_WINDOWEVENT && event.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
-                vulkan->RebuildSwapchain();
-                continue;
-            }
-        }
-        return true;
+//        SDL_Event event;
+//        while (SDL_PollEvent(&event)) {
+//            ImGui_ImplSDL2_ProcessEvent(&event);
+//
+//            if (event.type == SDL_QUIT) {
+//                return false;
+//            }
+//            if (event.type == SDL_WINDOWEVENT && event.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
+//                vulkan->RebuildSwapchain();
+//                continue;
+//            }
+//        }
+//        return true;
     }
 
     void UpdateBuffer(vk::CommandBuffer cmd, GpuBufferInfo* info, void* src, vk::DeviceSize size) {
@@ -212,12 +224,12 @@ struct App {
                 GpuBufferInfo idx_buffer_info;
                 if (!vulkan->AllocateTemporary(&vtx_buffer_info, vtx_buffer_size, alignof(ImDrawVert))) {
                     fprintf(stderr, "Failed to allocate vertex buffer for ImGui\n");
-                    return;
+                    continue;
                 }
 
                 if (!vulkan->AllocateTemporary(&idx_buffer_info, idx_buffer_size, alignof(ImDrawIdx))) {
                     fprintf(stderr, "Failed to allocate index buffer for ImGui\n");
-                    return;
+                    continue;
                 }
 
                 if (use_memcpy) {

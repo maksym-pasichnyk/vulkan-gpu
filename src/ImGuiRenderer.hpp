@@ -7,7 +7,7 @@
 #include "VulkanRenderer.hpp"
 
 #include <imgui_internal.h>
-#include <backends/imgui_impl_sdl2.h>
+#include <backends/imgui_impl_glfw.h>
 #include <backends/imgui_impl_vulkan.h>
 
 struct ImGuiRenderer {
@@ -20,7 +20,8 @@ struct ImGuiRenderer {
     ImGuiRenderer(VulkanRenderer* vulkan, void* window) : vulkan(vulkan) {
         ImGui::CreateContext();
 
-        ImGui_ImplSDL2_InitForVulkan(static_cast<SDL_Window*>(window));
+        ImGui_ImplGlfw_InitForVulkan(static_cast<GLFWwindow*>(window), true);
+//        ImGui_ImplSDL2_InitForVulkan(static_cast<SDL_Window*>(window));
 
         CreateFontTexture();
         CreateDeviceObjects();
@@ -32,7 +33,8 @@ struct ImGuiRenderer {
 
         gpu_destroy_graphics_pipeline_state(&vulkan->context, &graphics_pipeline_state);
 
-        ImGui_ImplSDL2_Shutdown();
+//        ImGui_ImplSDL2_Shutdown();
+        ImGui_ImplGlfw_Shutdown();
         ImGui::DestroyContext();
     }
 

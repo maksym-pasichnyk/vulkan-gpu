@@ -5,14 +5,13 @@
 #pragma once
 
 #define VK_NO_PROTOTYPES
-#define VK_USE_PLATFORM_METAL_EXT
-#define VK_USE_PLATFORM_MACOS_MVK
 #define VK_ENABLE_BETA_EXTENSIONS
 
 #include "numeric.hpp"
 
+#include <GLFW/glfw3.h>
 #include <vulkan/vulkan.hpp>
-#include <SDL_vulkan.h>
+//#include <SDL_vulkan.h>
 
 template<typename T>
 using Slice = vk::ArrayProxyNoTemporaries<T>;
@@ -238,13 +237,13 @@ void gpu_destroy_allocator(GpuContext* context, GpuLinearAllocator* allocator) {
     gpu_free_memory(context, &allocator->allocation);
 }
 
-void gpu_create_context(GpuContext* context, SDL_Window* window, PFN_vkGetInstanceProcAddr vk_get_instance_proc_addr) {
+void gpu_create_context(GpuContext* context, GLFWwindow* window, PFN_vkGetInstanceProcAddr vk_get_instance_proc_addr) {
     vk::defaultDispatchLoaderDynamic.init(vk_get_instance_proc_addr);
 
     std::vector<const char*> instance_extensions;
     instance_extensions.push_back("VK_KHR_surface");
     instance_extensions.push_back("VK_EXT_debug_utils");
-    instance_extensions.push_back("VK_MVK_macos_surface");
+    instance_extensions.push_back("VK_EXT_metal_surface");
     instance_extensions.push_back("VK_KHR_device_group_creation");
     instance_extensions.push_back("VK_KHR_portability_enumeration");
     instance_extensions.push_back("VK_KHR_get_physical_device_properties2");
@@ -288,7 +287,12 @@ void gpu_create_context(GpuContext* context, SDL_Window* window, PFN_vkGetInstan
 
     context->messenger = context->instance.createDebugUtilsMessengerEXT(messenger_create_info);
 
-    SDL_Vulkan_CreateSurface(window, context->instance, reinterpret_cast<VkSurfaceKHR*>(&context->surface));
+    VkResult result = glfwCreateWindowSurface(context->instance, window, nullptr, reinterpret_cast<VkSurfaceKHR*>(&context->surface));
+    if (result != VK_SUCCESS) {
+        fprintf(stderr, "Failed to create window surface: %s\n", vk::to_string(static_cast<vk::Result>(result)).c_str());
+        exit(1);
+    }
+//    SDL_Vulkan_CreateSurface(window, context->instance, reinterpret_cast<VkSurfaceKHR*>(&context->surface));
 
     context->physical_device = context->instance.enumeratePhysicalDevices().front();
 
