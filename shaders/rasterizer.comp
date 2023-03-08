@@ -19,14 +19,14 @@ layout(buffer_reference, std430, buffer_reference_align = 4) buffer VertexBuffer
 };
 
 layout(push_constant) uniform RasterizerPushConstants {
-    uint64_t    index_buffer_reference;
-    uint64_t    vertex_buffer_reference;
-    vec2        viwport_scale;
-    uint        index_offset;
-    float       clip_rect_min_x;
-    float       clip_rect_min_y;
-    float       clip_rect_max_x;
-    float       clip_rect_max_y;
+    IndexBufferReference    index_buffer_reference;
+    VertexBufferReference   vertex_buffer_reference;
+    vec2                    viwport_scale;
+    uint                    index_offset;
+    float                   clip_rect_min_x;
+    float                   clip_rect_min_y;
+    float                   clip_rect_max_x;
+    float                   clip_rect_max_y;
 } state;
 
 float area(vec2 v1, vec2 v2, vec2 v3) {
@@ -86,10 +86,14 @@ void draw_triangle(
     vec2 Btex = v2.texcoord;
     vec2 Ctex = v3.texcoord;
 
+    vec2 p1 = v1.position * state.viwport_scale;
+    vec2 p2 = v2.position * state.viwport_scale;
+    vec2 p3 = v3.position * state.viwport_scale;
+
     vec3 bc = barycentric(
-        vec3(v1.position * state.viwport_scale, 0.0F),
-        vec3(v2.position * state.viwport_scale, 0.0F),
-        vec3(v3.position * state.viwport_scale, 0.0F),
+        vec3(p1, 0.0F),
+        vec3(p2, 0.0F),
+        vec3(p3, 0.0F),
         vec3(pixel, 0.0F)
     );
 
@@ -106,28 +110,23 @@ void draw_triangle(
     }
 }
 
-layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 void main() {
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy) + ivec2(state.clip_rect_min_x, state.clip_rect_min_y);
-    ivec2 size = imageSize(ColorImage);
-
-    if (pixel.x >= size.x || pixel.y >= size.y) {
-        return;
-    }
 
     if (pixel.x > state.clip_rect_max_x || pixel.y > state.clip_rect_max_y) {
         return;
     }
 
     uint i  = state.index_offset;
-    uint i0 = IndexBufferReference(state.index_buffer_reference)[i + 0].element;
-    uint i1 = IndexBufferReference(state.index_buffer_reference)[i + 1].element;
-    uint i2 = IndexBufferReference(state.index_buffer_reference)[i + 2].element;
+    uint i0 = state.index_buffer_reference[i + 0].element;
+    uint i1 = state.index_buffer_reference[i + 1].element;
+    uint i2 = state.index_buffer_reference[i + 2].element;
 
     draw_triangle(
         pixel,
-        VertexBufferReference(state.vertex_buffer_reference)[i0],
-        VertexBufferReference(state.vertex_buffer_reference)[i1],
-        VertexBufferReference(state.vertex_buffer_reference)[i2]
+        state.vertex_buffer_reference[i0],
+        state.vertex_buffer_reference[i1],
+        state.vertex_buffer_reference[i2]
     );
 }
