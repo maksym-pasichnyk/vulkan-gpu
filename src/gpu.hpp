@@ -256,9 +256,11 @@ void gpu_create_context(GpuContext* context, GLFWwindow* window, PFN_vkGetInstan
     instance_extensions.push_back("VK_KHR_get_physical_device_properties2");
 
     std::vector<const char*> instance_layers;
-    // instance_layers.push_back("VK_LAYER_KHRONOS_validation");
-    // instance_layers.push_back("VK_LAYER_KHRONOS_synchronization2");
-
+#if __APPLE__
+     instance_layers.push_back("VK_LAYER_KHRONOS_validation");
+     instance_layers.push_back("VK_LAYER_KHRONOS_synchronization2");
+#endif
+     
     auto app_info = vk::ApplicationInfo()
         .setPApplicationName("Dragon")
         .setApplicationVersion(VK_MAKE_VERSION(1, 0, 0))
