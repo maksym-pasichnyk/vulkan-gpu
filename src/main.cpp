@@ -13,6 +13,10 @@ struct RasterizerPushConstants {
     vk::DeviceAddress   vertex_buffer_reference;
     ImVec2              viewport_scale;
     u32                 index_offset;
+    f32                 clip_rect_min_x;
+    f32                 clip_rect_min_y;
+    f32                 clip_rect_max_x;
+    f32                 clip_rect_max_y;
 };
 
 struct float2 {
@@ -84,7 +88,7 @@ struct App {
         ImGui::Text("Application average %.3f ms/frame (%.1f FPS)", 1000.0f / ImGui::GetIO().Framerate, ImGui::GetIO().Framerate);
         ImGui::Checkbox("Use memcpy", &use_memcpy);
         ImGui::End();
-//        ImGui::ShowDemoWindow(nullptr);
+        ImGui::ShowDemoWindow(nullptr);
         ImGui::Render();
     }
 
@@ -105,13 +109,14 @@ struct App {
     }
 
     void UpdateBuffer(vk::CommandBuffer cmd, GpuBufferInfo* info, void* src, vk::DeviceSize size) {
-        auto remaining = size;
-        auto offset = 0;
+        vk::DeviceSize max_data_size = 65536;
+        vk::DeviceSize remaining = size;
+        vk::DeviceSize offset = 0;
 
-        while (remaining > 65536) {
-            cmd.updateBuffer(info->buffer, info->offset + offset, 65536, reinterpret_cast<u8*>(src) + offset);
-            remaining -= 65536;
-            offset += 65536;
+        while (remaining > max_data_size) {
+            cmd.updateBuffer(info->buffer, info->offset + offset, max_data_size, reinterpret_cast<u8*>(src) + offset);
+            remaining -= max_data_size;
+            offset += max_data_size;
         }
 
         if (remaining > 0) {
@@ -193,6 +198,12 @@ struct App {
         cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, compute_pipeline_state.pipeline_layout, 0, 1, &bind_group, 0, nullptr);
 
         if (draw_data->TotalVtxCount > 0) {
+            auto fb_width = static_cast<i32>(draw_data->DisplaySize.x * draw_data->FramebufferScale.x);
+            auto fb_height = static_cast<i32>(draw_data->DisplaySize.y * draw_data->FramebufferScale.y);
+
+            auto clip_off = draw_data->DisplayPos;
+            auto clip_scale = draw_data->FramebufferScale;
+
             for (auto cmd_list : std::span(draw_data->CmdLists, draw_data->CmdListsCount)) {
                 auto vtx_buffer_size = cmd_list->VtxBuffer.Size * sizeof(ImDrawVert);
                 auto idx_buffer_size = cmd_list->IdxBuffer.Size * sizeof(ImDrawIdx);
@@ -219,20 +230,36 @@ struct App {
 
                 auto viewport_scale = ImGui::GetIO().DisplayFramebufferScale;
 
-                for (u32 i = 0; i < cmd_list->IdxBuffer.Size; i += 3) {
-                    auto push_constants = RasterizerPushConstants{
-                        .index_buffer_reference = idx_buffer_info.device_address,
-                        .vertex_buffer_reference = vtx_buffer_info.device_address,
-                        .viewport_scale = viewport_scale,
-                        .index_offset = i
-                    };
-                    cmd.pushConstants(compute_pipeline_state.pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push_constants), &push_constants);
+                for (auto& draw_cmd : std::span(cmd_list->CmdBuffer.Data, cmd_list->CmdBuffer.Size)) {
+                    auto clip_rect = ImRect(
+                        (ImVec2(draw_cmd.ClipRect.x, draw_cmd.ClipRect.y) - clip_off) * clip_scale,
+                        (ImVec2(draw_cmd.ClipRect.z, draw_cmd.ClipRect.w) - clip_off) * clip_scale
+                    );
+                    clip_rect.ClipWith(ImRect(0, 0, static_cast<f32>(fb_width), static_cast<f32>(fb_height)));
 
-                    i32 group_count_x = static_cast<i32>(vulkan->configuration.extent.width + 15) / 16;
-                    i32 group_count_y = static_cast<i32>(vulkan->configuration.extent.height + 15) / 16;
+                    if (clip_rect.Min.x >= clip_rect.Max.x || clip_rect.Min.y >= clip_rect.Max.y) {
+                        continue;
+                    }
+                    assert(draw_cmd.VtxOffset == 0);
 
-                    // todo: reduce group count
-                    cmd.dispatch(group_count_x, group_count_y, 1);
+                    i32 group_count_x = static_cast<i32>(clip_rect.GetWidth() + 7) / 8;
+                    i32 group_count_y = static_cast<i32>(clip_rect.GetHeight() + 7) / 8;
+                    for (u32 i = 0; i < draw_cmd.ElemCount; i += 3) {
+                        auto push_constants = RasterizerPushConstants{
+                            .index_buffer_reference = idx_buffer_info.device_address,
+                            .vertex_buffer_reference = vtx_buffer_info.device_address,
+                            .viewport_scale = viewport_scale,
+                            .index_offset = draw_cmd.IdxOffset + i,
+                            .clip_rect_min_x = clip_rect.Min.x,
+                            .clip_rect_min_y = clip_rect.Min.y,
+                            .clip_rect_max_x = clip_rect.Max.x,
+                            .clip_rect_max_y = clip_rect.Max.y,
+                        };
+
+                        cmd.pushConstants(compute_pipeline_state.pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push_constants), &push_constants);
+
+                        cmd.dispatch(group_count_x, group_count_y, 1);
+                    }
                 }
             }
         }

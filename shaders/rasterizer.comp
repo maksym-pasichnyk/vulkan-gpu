@@ -23,6 +23,10 @@ layout(push_constant) uniform RasterizerPushConstants {
     uint64_t    vertex_buffer_reference;
     vec2        viwport_scale;
     uint        index_offset;
+    float       clip_rect_min_x;
+    float       clip_rect_min_y;
+    float       clip_rect_max_x;
+    float       clip_rect_max_y;
 } state;
 
 float area(vec2 v1, vec2 v2, vec2 v3) {
@@ -74,16 +78,6 @@ void draw_triangle(
     in VertexBufferReference v2,
     in VertexBufferReference v3
 ) {
-    vec4 min_max = get_min_max(
-        v1.position * state.viwport_scale,
-        v2.position * state.viwport_scale,
-        v3.position * state.viwport_scale
-    );
-    uint startX = uint(min_max.x);
-    uint startY = uint(min_max.y);
-    uint endX = uint(min_max.z);
-    uint endY = uint(min_max.w);
-
     vec4 Acol = unpack(v1.color);
     vec4 Bcol = unpack(v2.color);
     vec4 Ccol = unpack(v3.color);
@@ -92,42 +86,40 @@ void draw_triangle(
     vec2 Btex = v2.texcoord;
     vec2 Ctex = v3.texcoord;
 
-//    for (uint x = startX; x <= endX; ++x) {
-//        for (uint y = startY; y <= endY; ++y) {
-            vec3 bc = barycentric(
-                vec3(v1.position * state.viwport_scale, 0.0F),
-                vec3(v2.position * state.viwport_scale, 0.0F),
-                vec3(v3.position * state.viwport_scale, 0.0F),
-                vec3(pixel, 0.0F)
-            );
+    vec3 bc = barycentric(
+        vec3(v1.position * state.viwport_scale, 0.0F),
+        vec3(v2.position * state.viwport_scale, 0.0F),
+        vec3(v3.position * state.viwport_scale, 0.0F),
+        vec3(pixel, 0.0F)
+    );
 
-            if (bc.x < 0.0 || bc.y < 0.0 || bc.z < 0.0) {
-                return;
-            }
+    if (bc.x < 0.0 || bc.y < 0.0 || bc.z < 0.0) {
+        return;
+    }
 
-            vec4 b_col = Acol * bc.x + Bcol * bc.y + Ccol * bc.z;
-            vec2 b_tex = Atex * bc.x + Btex * bc.y + Ctex * bc.z;
+    vec4 b_col = Acol * bc.x + Bcol * bc.y + Ccol * bc.z;
+    vec2 b_tex = Atex * bc.x + Btex * bc.y + Ctex * bc.z;
 
-            vec4 color = texture(Texture, b_tex);
-            if (color.a < 0.1F) {
-                return;
-            }
-
-            imageStore(ColorImage, pixel, color * b_col);
-//        }
-//    }
+    vec4 color = texture(Texture, b_tex) * b_col;
+    if (color.a > 0.0F) {
+        imageStore(ColorImage, pixel, color);
+    }
 }
 
-layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 void main() {
-    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy) + ivec2(state.clip_rect_min_x, state.clip_rect_min_y);
     ivec2 size = imageSize(ColorImage);
 
     if (pixel.x >= size.x || pixel.y >= size.y) {
         return;
     }
 
-    uint i = state.index_offset;
+    if (pixel.x > state.clip_rect_max_x || pixel.y > state.clip_rect_max_y) {
+        return;
+    }
+
+    uint i  = state.index_offset;
     uint i0 = IndexBufferReference(state.index_buffer_reference)[i + 0].element;
     uint i1 = IndexBufferReference(state.index_buffer_reference)[i + 1].element;
     uint i2 = IndexBufferReference(state.index_buffer_reference)[i + 2].element;
