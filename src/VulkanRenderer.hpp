@@ -18,6 +18,8 @@ struct SurfaceConfiguration {
 };
 
 struct VulkanRenderer {
+    i32 max_frames_in_flight = 3;
+
     vk::DynamicLoader                           loader;
     GpuContext                                  context;
 
@@ -31,6 +33,15 @@ struct VulkanRenderer {
     std::vector<vk::Framebuffer>                swapchain_framebuffers;
 
     std::vector<GpuTexture>                     color_textures;
+
+    std::vector<vk::Fence>                      in_flight_fences;
+    std::vector<vk::Semaphore>                  image_available_semaphores;
+    std::vector<vk::Semaphore>                  render_finished_semaphores;
+
+    vk::CommandPool                             command_pool;
+    std::vector<vk::CommandBuffer>              command_buffers;
+    std::vector<GpuLinearAllocator>             frame_allocators;
+    std::vector<vk::DescriptorPool>             bind_group_allocators;
 
     u32                                         image_index = 0;
     usize                                       frame_index = 0;
@@ -91,13 +102,70 @@ struct VulkanRenderer {
         swapchain_render_pass = context.logical_device.createRenderPass(render_pass_create_info);
 
         ConfigureSwapchain();
+        CreateDeviceResources();
     }
 
     ~VulkanRenderer() {
+        CleanupDeviceResources();
         CleanupSwapchain();
 
         context.logical_device.destroyRenderPass(swapchain_render_pass);
         gpu_destroy_context(&context);
+    }
+
+    void CreateDeviceResources() {
+        auto command_pool_create_info = vk::CommandPoolCreateInfo()
+            .setQueueFamilyIndex(context.graphics_queue_family_index)
+            .setFlags(vk::CommandPoolCreateFlagBits::eResetCommandBuffer);
+
+        command_pool = context.logical_device.createCommandPool(command_pool_create_info);
+
+        auto command_buffer_allocate_info = vk::CommandBufferAllocateInfo()
+            .setCommandPool(command_pool)
+            .setLevel(vk::CommandBufferLevel::ePrimary)
+            .setCommandBufferCount(max_frames_in_flight);
+        command_buffers = context.logical_device.allocateCommandBuffers(command_buffer_allocate_info);
+
+        frame_allocators.resize(max_frames_in_flight);
+        bind_group_allocators.resize(max_frames_in_flight);
+
+        in_flight_fences.resize(max_frames_in_flight);
+        image_available_semaphores.resize(max_frames_in_flight);
+        render_finished_semaphores.resize(max_frames_in_flight);
+
+        auto pool_sizes = std::array{
+            vk::DescriptorPoolSize{vk::DescriptorType::eSampler                  , 1024},
+            vk::DescriptorPoolSize{vk::DescriptorType::eSampledImage             , 1024},
+            vk::DescriptorPoolSize{vk::DescriptorType::eCombinedImageSampler     , 1024},
+            vk::DescriptorPoolSize{vk::DescriptorType::eStorageImage             , 1024},
+            vk::DescriptorPoolSize{vk::DescriptorType::eUniformTexelBuffer       , 1024},
+            vk::DescriptorPoolSize{vk::DescriptorType::eStorageTexelBuffer       , 1024},
+            vk::DescriptorPoolSize{vk::DescriptorType::eUniformBuffer            , 1024},
+            vk::DescriptorPoolSize{vk::DescriptorType::eStorageBuffer            , 1024},
+            vk::DescriptorPoolSize{vk::DescriptorType::eUniformBufferDynamic     , 1024},
+            vk::DescriptorPoolSize{vk::DescriptorType::eStorageBufferDynamic     , 1024}
+        };
+
+        for (size_t i = 0; i < max_frames_in_flight; i++) {
+            gpu_create_allocator(&context, &frame_allocators[i], 5 * 1024 * 1024);
+            bind_group_allocators[i] = context.logical_device.createDescriptorPool(vk::DescriptorPoolCreateInfo({}, 1000, pool_sizes));
+
+            in_flight_fences[i] = context.logical_device.createFence(vk::FenceCreateInfo(vk::FenceCreateFlagBits::eSignaled));
+            image_available_semaphores[i] = context.logical_device.createSemaphore(vk::SemaphoreCreateInfo());
+            render_finished_semaphores[i] = context.logical_device.createSemaphore(vk::SemaphoreCreateInfo());
+        }
+    }
+
+    void CleanupDeviceResources() {
+        for (size_t i = 0; i < max_frames_in_flight; i++) {
+            gpu_destroy_allocator(&context, &frame_allocators[i]);
+            context.logical_device.destroyDescriptorPool(bind_group_allocators[i]);
+            context.logical_device.destroyFence(in_flight_fences[i]);
+            context.logical_device.destroySemaphore(image_available_semaphores[i]);
+            context.logical_device.destroySemaphore(render_finished_semaphores[i]);
+        }
+        context.logical_device.freeCommandBuffers(command_pool, command_buffers);
+        context.logical_device.destroyCommandPool(command_pool);
     }
 
     void ConfigureSwapchain() {
@@ -147,7 +215,7 @@ struct VulkanRenderer {
                 .setArrayLayers(1)
                 .setSamples(vk::SampleCountFlagBits::e1)
                 .setTiling(vk::ImageTiling::eOptimal)
-                .setUsage(vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eStorage)
+                .setUsage(vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eTransferDst)
                 .setSharingMode(vk::SharingMode::eExclusive)
                 .setQueueFamilyIndices({})
                 .setInitialLayout(vk::ImageLayout::eUndefined);
@@ -180,6 +248,23 @@ struct VulkanRenderer {
                     .setLayerCount(1));
 
             color_textures[i].view = context.logical_device.createImageView(color_view_create_info);
+            color_textures[i].sampler = context.logical_device.createSampler(vk::SamplerCreateInfo()
+                .setMagFilter(vk::Filter::eNearest)
+                .setMinFilter(vk::Filter::eNearest)
+                .setAddressModeU(vk::SamplerAddressMode::eClampToEdge)
+                .setAddressModeV(vk::SamplerAddressMode::eClampToEdge)
+                .setAddressModeW(vk::SamplerAddressMode::eClampToEdge)
+                .setAnisotropyEnable(false)
+                .setMaxAnisotropy(1.0f)
+                .setBorderColor(vk::BorderColor::eFloatOpaqueWhite)
+                .setUnnormalizedCoordinates(false)
+                .setCompareEnable(false)
+                .setCompareOp(vk::CompareOp::eAlways)
+                .setMipmapMode(vk::SamplerMipmapMode::eNearest)
+                .setMipLodBias(0.0f)
+                .setMinLod(0.0f)
+                .setMaxLod(0.0f)
+            );
 
             auto swapchain_view_create_info = vk::ImageViewCreateInfo()
                 .setImage(swapchain_images[i])
@@ -216,9 +301,7 @@ struct VulkanRenderer {
 
     void CleanupSwapchain() {
         for (size_t i = 0; i < swapchain_images.size(); i++) {
-            context.logical_device.destroyImage(color_textures[i].image);
-            context.logical_device.destroyImageView(color_textures[i].view);
-            gpu_free_memory(&context, &color_textures[i].allocation);
+            CleanupTexture(&color_textures[i]);
 
             context.logical_device.destroyImageView(swapchain_views[i]);
             context.logical_device.destroyFramebuffer(swapchain_framebuffers[i]);
@@ -234,21 +317,21 @@ struct VulkanRenderer {
     }
 
     void WaitAndBeginNewFrame() {
-        vk::resultCheck(context.logical_device.waitForFences(context.in_flight_fences[frame_index], VK_TRUE, UINT64_MAX), "Failed to wait for fence");
+        vk::resultCheck(context.logical_device.waitForFences(in_flight_fences[frame_index], VK_TRUE, UINT64_MAX), "Failed to wait for fence");
 
-        auto result = context.logical_device.acquireNextImageKHR(swapchain, UINT64_MAX, context.image_available_semaphores[frame_index], nullptr, &image_index);
+        auto result = context.logical_device.acquireNextImageKHR(swapchain, UINT64_MAX, image_available_semaphores[frame_index], nullptr, &image_index);
         if (result != vk::Result::eErrorOutOfDateKHR && result != vk::Result::eSuboptimalKHR) {
             vk::resultCheck(result, "Failed to acquire swapchain image");
         }
 
-        gpu_allocator_reset(&context.frame_allocators[frame_index]);
+        gpu_allocator_reset(&frame_allocators[frame_index]);
 
-        context.logical_device.resetDescriptorPool(context.bind_group_allocators[frame_index]);
-        context.command_buffers[frame_index].begin(vk::CommandBufferBeginInfo(vk::CommandBufferUsageFlagBits::eOneTimeSubmit));
+        context.logical_device.resetDescriptorPool(bind_group_allocators[frame_index]);
+        command_buffers[frame_index].begin(vk::CommandBufferBeginInfo(vk::CommandBufferUsageFlagBits::eOneTimeSubmit));
     }
 
     void SubmitFrameAndPresent() {
-        context.command_buffers[frame_index].end();
+        command_buffers[frame_index].end();
 
         auto wait_stages = std::array{
             vk::PipelineStageFlags(vk::PipelineStageFlagBits::eColorAttachmentOutput)
@@ -256,19 +339,19 @@ struct VulkanRenderer {
 
         auto submit_info = vk::SubmitInfo()
             .setWaitSemaphoreCount(1)
-            .setPWaitSemaphores(&context.image_available_semaphores[frame_index])
+            .setPWaitSemaphores(&image_available_semaphores[frame_index])
             .setPWaitDstStageMask(wait_stages.data())
             .setCommandBufferCount(1)
-            .setPCommandBuffers(&context.command_buffers[frame_index])
+            .setPCommandBuffers(&command_buffers[frame_index])
             .setSignalSemaphoreCount(1)
-            .setPSignalSemaphores(&context.render_finished_semaphores[frame_index]);
+            .setPSignalSemaphores(&render_finished_semaphores[frame_index]);
 
-        context.logical_device.resetFences(context.in_flight_fences[frame_index]);
-        context.graphics_queue.submit(submit_info, context.in_flight_fences[frame_index]);
+        context.logical_device.resetFences(in_flight_fences[frame_index]);
+        context.graphics_queue.submit(submit_info, in_flight_fences[frame_index]);
 
         auto present_info = vk::PresentInfoKHR()
             .setWaitSemaphoreCount(1)
-            .setPWaitSemaphores(&context.render_finished_semaphores[frame_index])
+            .setPWaitSemaphores(&render_finished_semaphores[frame_index])
             .setSwapchainCount(1)
             .setPSwapchains(&swapchain)
             .setPImageIndices(&image_index);
@@ -280,11 +363,11 @@ struct VulkanRenderer {
     }
 
     void IncrementFrameIndex() {
-        frame_index = (frame_index + 1) % context.max_frames_in_flight;
+        frame_index = (frame_index + 1) % max_frames_in_flight;
     }
 
     auto AllocateTemporary(GpuBufferInfo* info, vk::DeviceSize size, vk::DeviceSize alignment) -> bool {
-        return gpu_allocator_allocate(&context.frame_allocators[frame_index], info, size, alignment);
+        return gpu_allocator_allocate(&frame_allocators[frame_index], info, size, alignment);
     }
 
     auto LoadShaderModule(const std::string& filename) -> Result<vk::ShaderModule, std::runtime_error> {
@@ -388,7 +471,18 @@ struct VulkanRenderer {
 
             std::memcpy(allocation.mapped, pixels, size_in_bytes);
 
-            auto cmd = context.command_buffers[0];
+            auto cmd_pool = context.logical_device.createCommandPool(vk::CommandPoolCreateInfo()
+                .setQueueFamilyIndex(context.graphics_queue_family_index)
+                .setFlags(vk::CommandPoolCreateFlagBits::eResetCommandBuffer)
+            );
+
+            auto cmd_allocate_info = vk::CommandBufferAllocateInfo()
+                .setCommandPool(cmd_pool)
+                .setLevel(vk::CommandBufferLevel::ePrimary)
+                .setCommandBufferCount(1);
+
+            vk::CommandBuffer cmd;
+            vk::resultCheck(context.logical_device.allocateCommandBuffers(&cmd_allocate_info, &cmd), "Failed to allocate command buffer");
             cmd.begin(vk::CommandBufferBeginInfo(vk::CommandBufferUsageFlagBits::eOneTimeSubmit));
 
             {
@@ -420,7 +514,7 @@ struct VulkanRenderer {
                         .setSrcAccessMask(vk::AccessFlagBits2KHR::eTransferWrite)
                         .setDstAccessMask(vk::AccessFlagBits2KHR::eShaderRead)
                         .setSrcStageMask(vk::PipelineStageFlagBits2KHR::eTransfer)
-                        .setDstStageMask(vk::PipelineStageFlagBits2KHR::eFragmentShader)
+                        .setDstStageMask(vk::PipelineStageFlagBits2KHR::eFragmentShader | vk::PipelineStageFlagBits2KHR::eComputeShader)
                         .setOldLayout(vk::ImageLayout::eTransferDstOptimal)
                         .setNewLayout(vk::ImageLayout::eShaderReadOnlyOptimal)
                         .setSrcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
@@ -440,10 +534,13 @@ struct VulkanRenderer {
             context.logical_device.destroyFence(fence);
             context.logical_device.destroyBuffer(tmp);
             gpu_free_memory(&context, &allocation);
+
+            context.logical_device.freeCommandBuffers(cmd_pool, 1, &cmd);
+            context.logical_device.destroyCommandPool(cmd_pool);
         }
     }
 
-    void DestroyTexture(GpuTexture* texture) {
+    void CleanupTexture(GpuTexture* texture) {
         if (texture->sampler) {
             context.logical_device.destroySampler(texture->sampler);
         }

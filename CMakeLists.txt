@@ -14,8 +14,9 @@ add_library(imgui STATIC "${imgui_SOURCE_DIR}/imgui.h" "${imgui_SOURCE_DIR}/imgu
 
 target_include_directories(imgui PUBLIC "${imgui_SOURCE_DIR}")
 target_compile_definitions(imgui PUBLIC -DIMGUI_DEFINE_MATH_OPERATORS)
+target_compile_definitions(imgui PUBLIC -DIMGUI_USER_CONFIG=<${CMAKE_CURRENT_SOURCE_DIR}/src/imgui_config_override.hpp>)
 
-add_executable(game src/main.cpp src/numeric.hpp src/enum.hpp src/result.hpp src/gpu.hpp src/vulkan.hpp)
+add_executable(game src/main.cpp src/numeric.hpp src/enum.hpp src/result.hpp src/gpu.hpp src/VulkanRenderer.hpp src/ImGuiRenderer.hpp src/imgui_config_override.hpp)
 target_link_libraries(game PUBLIC SDL2::SDL2 Vulkan::Vulkan imgui)
 
 function(target_compile_shaders TARGET_NAME)

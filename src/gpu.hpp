@@ -60,19 +60,19 @@ struct GpuVertexInputState {
 };
 
 struct GpuAllocation {
-    void*                   mapped;
-    vk::DeviceMemory        device_memory;
-    vk::MemoryRequirements  memory_requirements;
-    vk::MemoryPropertyFlags memory_property_flags;
+    void*                   mapped                  = {};
+    vk::DeviceMemory        device_memory           = {};
+    vk::MemoryRequirements  memory_requirements     = {};
+    vk::MemoryPropertyFlags memory_property_flags   = {};
 };
 
 struct GpuBufferInfo {
-    vk::Buffer          buffer;
-    void*               mapped;
-    vk::DeviceSize      size;
-    vk::DeviceSize      offset;
-    GpuAllocation       allocation;
-    vk::DeviceAddress   device_address;
+    vk::Buffer          buffer          = {};
+    void*               mapped          = {};
+    vk::DeviceSize      size            = {};
+    vk::DeviceSize      offset          = {};
+    GpuAllocation       allocation      = {};
+    vk::DeviceAddress   device_address  = {};
 };
 
 struct GpuTexture {
@@ -123,28 +123,17 @@ struct GpuLinearAllocator {
 };
 
 struct GpuContext {
-    i32 max_frames_in_flight = 3;
-
-    vk::Instance                                instance;
-    vk::SurfaceKHR                              surface;
-    vk::DebugUtilsMessengerEXT                  messenger;
-    vk::Device                                  logical_device;
-    vk::PhysicalDevice                          physical_device;
-    vk::Queue                                   graphics_queue;
-    uint32_t                                    graphics_queue_family_index;
-    vk::Queue                                   present_queue;
-    uint32_t                                    present_queue_family_index;
-    vk::Queue                                   compute_queue;
-    uint32_t                                    compute_queue_family_index;
-
-    std::vector<vk::Fence>                      in_flight_fences;
-    std::vector<vk::Semaphore>                  image_available_semaphores;
-    std::vector<vk::Semaphore>                  render_finished_semaphores;
-
-    vk::CommandPool                             command_pool;
-    std::vector<vk::CommandBuffer>              command_buffers;
-    std::vector<GpuLinearAllocator>             frame_allocators;
-    std::vector<vk::DescriptorPool>             bind_group_allocators;
+    vk::Instance                    instance;
+    vk::SurfaceKHR                  surface;
+    vk::DebugUtilsMessengerEXT      messenger;
+    vk::Device                      logical_device;
+    vk::PhysicalDevice              physical_device;
+    vk::Queue                       graphics_queue;
+    uint32_t                        graphics_queue_family_index;
+    vk::Queue                       present_queue;
+    uint32_t                        present_queue_family_index;
+    vk::Queue                       compute_queue;
+    uint32_t                        compute_queue_family_index;
 };
 
 auto debug_utils_messenger_callback(vk::DebugUtilsMessageSeverityFlagBitsEXT messageSeverity, unsigned int messageType, const vk::DebugUtilsMessengerCallbackDataEXT* pCallbackData, void* pUserData) -> vk::Bool32 {
@@ -372,58 +361,9 @@ void gpu_create_context(GpuContext* context, SDL_Window* window, PFN_vkGetInstan
         }
     }
     context->compute_queue = context->logical_device.getQueue(context->compute_queue_family_index, 0);
-
-    auto command_pool_create_info = vk::CommandPoolCreateInfo()
-        .setQueueFamilyIndex(context->graphics_queue_family_index)
-        .setFlags(vk::CommandPoolCreateFlagBits::eResetCommandBuffer);
-
-    context->command_pool = context->logical_device.createCommandPool(command_pool_create_info);
-
-    auto command_buffer_allocate_info = vk::CommandBufferAllocateInfo()
-        .setCommandPool(context->command_pool)
-        .setLevel(vk::CommandBufferLevel::ePrimary)
-        .setCommandBufferCount(context->max_frames_in_flight);
-    context->command_buffers = context->logical_device.allocateCommandBuffers(command_buffer_allocate_info);
-
-    context->in_flight_fences.resize(context->max_frames_in_flight);
-    context->image_available_semaphores.resize(context->max_frames_in_flight);
-    context->render_finished_semaphores.resize(context->max_frames_in_flight);
-
-    context->frame_allocators.resize(context->max_frames_in_flight);
-    context->bind_group_allocators.resize(context->max_frames_in_flight);
-
-    auto pool_sizes = std::array{
-        vk::DescriptorPoolSize{vk::DescriptorType::eSampler                  , 1024},
-        vk::DescriptorPoolSize{vk::DescriptorType::eSampledImage             , 1024},
-        vk::DescriptorPoolSize{vk::DescriptorType::eCombinedImageSampler     , 1024},
-        vk::DescriptorPoolSize{vk::DescriptorType::eStorageImage             , 1024},
-        vk::DescriptorPoolSize{vk::DescriptorType::eUniformTexelBuffer       , 1024},
-        vk::DescriptorPoolSize{vk::DescriptorType::eStorageTexelBuffer       , 1024},
-        vk::DescriptorPoolSize{vk::DescriptorType::eUniformBuffer            , 1024},
-        vk::DescriptorPoolSize{vk::DescriptorType::eStorageBuffer            , 1024},
-        vk::DescriptorPoolSize{vk::DescriptorType::eUniformBufferDynamic     , 1024},
-        vk::DescriptorPoolSize{vk::DescriptorType::eStorageBufferDynamic     , 1024}
-    };
-
-    for (size_t i = 0; i < context->max_frames_in_flight; i++) {
-        gpu_create_allocator(context, &context->frame_allocators[i], 5 * 1024 * 1024);
-        context->bind_group_allocators[i] = context->logical_device.createDescriptorPool(vk::DescriptorPoolCreateInfo({}, 1000, pool_sizes));
-        context->in_flight_fences[i] = context->logical_device.createFence(vk::FenceCreateInfo(vk::FenceCreateFlagBits::eSignaled));
-        context->image_available_semaphores[i] = context->logical_device.createSemaphore(vk::SemaphoreCreateInfo());
-        context->render_finished_semaphores[i] = context->logical_device.createSemaphore(vk::SemaphoreCreateInfo());
-    }
 }
 
 void gpu_destroy_context(GpuContext* context) {
-    for (size_t i = 0; i < context->max_frames_in_flight; i++) {
-        gpu_destroy_allocator(context, &context->frame_allocators[i]);
-        context->logical_device.destroyDescriptorPool(context->bind_group_allocators[i]);
-        context->logical_device.destroyFence(context->in_flight_fences[i]);
-        context->logical_device.destroySemaphore(context->image_available_semaphores[i]);
-        context->logical_device.destroySemaphore(context->render_finished_semaphores[i]);
-    }
-    context->logical_device.freeCommandBuffers(context->command_pool, context->command_buffers);
-    context->logical_device.destroyCommandPool(context->command_pool);
     context->logical_device.destroy();
 
     context->instance.destroyDebugUtilsMessengerEXT(context->messenger);

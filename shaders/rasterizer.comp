@@ -6,26 +6,116 @@
 #extension GL_EXT_scalar_block_layout : enable
 
 layout(binding = 0, rgba32f) uniform image2D ColorImage;
+layout(binding = 1)          uniform sampler2D Texture;
 
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer IndexBufferReference {
     uint element;
 };
 
-layout(buffer_reference, std430, buffer_reference_align = 8) buffer VertexBufferReference {
-    vec2 element;
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer VertexBufferReference {
+    vec2 position;
+    vec2 texcoord;
+    uint color;
 };
 
 layout(push_constant) uniform RasterizerPushConstants {
-    IndexBufferReference    index_buffer_reference;
-    VertexBufferReference   vertex_buffer_reference;
-    uvec2                   viwport_size;
-    uint                    index_count;
+    uint64_t    index_buffer_reference;
+    uint64_t    vertex_buffer_reference;
+    vec2        viwport_scale;
+    uint        index_offset;
 } state;
 
 float area(vec2 v1, vec2 v2, vec2 v3) {
     vec2 a = v2 - v1;
     vec2 b = v3 - v1;
     return a.x * b.y - b.x * a.y;
+}
+
+vec4 unpack(uint color) {
+    vec4 result;
+    result.r = float((color >> 0) & 0xFFu) / 255.0F;
+    result.g = float((color >> 8) & 0xFFu) / 255.0F;
+    result.b = float((color >> 16) & 0xFFu) / 255.0F;
+    result.a = float((color >> 24) & 0xFFu) / 255.0F;
+    return result;
+}
+
+float triangle_area(vec2 a, vec2 b, vec2 c) {
+    vec2 ab = b - a;
+    vec2 ac = c - a;
+    return abs(ab.x * ac.y - ab.y * ac.x) * 0.5F;
+}
+
+vec3 barycentric(vec3 v1, vec3 v2, vec3 v3, vec3 p) {
+    vec3 a = vec3(v3.x - v1.x, v2.x - v1.x, v1.x - p.x);
+    vec3 b = vec3(v3.y - v1.y, v2.y - v1.y, v1.y - p.y);
+
+    vec3 u = cross(a, b);
+
+    if (abs(u.z) < 1.0) {
+        return vec3(-1.0, 1.0, 1.0);
+    }
+
+    return vec3(1.0 - (u.x + u.y) / u.z, u.y/ u.z, u.x / u.z);
+}
+
+vec4 get_min_max(vec2 v1, vec2 v2, vec2 v3) {
+    vec4 min_max;
+    min_max.x = min(min(v1.x, v2.x), v3.x);
+    min_max.y = min(min(v1.y, v2.y), v3.y);
+    min_max.z = max(max(v1.x, v2.x), v3.x);
+    min_max.w = max(max(v1.y, v2.y), v3.y);
+    return min_max;
+}
+
+void draw_triangle(
+    in ivec2 pixel,
+    in VertexBufferReference v1,
+    in VertexBufferReference v2,
+    in VertexBufferReference v3
+) {
+    vec4 min_max = get_min_max(
+        v1.position * state.viwport_scale,
+        v2.position * state.viwport_scale,
+        v3.position * state.viwport_scale
+    );
+    uint startX = uint(min_max.x);
+    uint startY = uint(min_max.y);
+    uint endX = uint(min_max.z);
+    uint endY = uint(min_max.w);
+
+    vec4 Acol = unpack(v1.color);
+    vec4 Bcol = unpack(v2.color);
+    vec4 Ccol = unpack(v3.color);
+
+    vec2 Atex = v1.texcoord;
+    vec2 Btex = v2.texcoord;
+    vec2 Ctex = v3.texcoord;
+
+//    for (uint x = startX; x <= endX; ++x) {
+//        for (uint y = startY; y <= endY; ++y) {
+            vec3 bc = barycentric(
+                vec3(v1.position * state.viwport_scale, 0.0F),
+                vec3(v2.position * state.viwport_scale, 0.0F),
+                vec3(v3.position * state.viwport_scale, 0.0F),
+                vec3(pixel, 0.0F)
+            );
+
+            if (bc.x < 0.0 || bc.y < 0.0 || bc.z < 0.0) {
+                return;
+            }
+
+            vec4 b_col = Acol * bc.x + Bcol * bc.y + Ccol * bc.z;
+            vec2 b_tex = Atex * bc.x + Btex * bc.y + Ctex * bc.z;
+
+            vec4 color = texture(Texture, b_tex);
+            if (color.a < 0.1F) {
+                return;
+            }
+
+            imageStore(ColorImage, pixel, color * b_col);
+//        }
+//    }
 }
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
@@ -37,25 +127,15 @@ void main() {
         return;
     }
 
-    imageStore(ColorImage, pixel, vec4(0, 0, 0, 0));
+    uint i = state.index_offset;
+    uint i0 = IndexBufferReference(state.index_buffer_reference)[i + 0].element;
+    uint i1 = IndexBufferReference(state.index_buffer_reference)[i + 1].element;
+    uint i2 = IndexBufferReference(state.index_buffer_reference)[i + 2].element;
 
-    for (uint i = 0; i < state.index_count; i += 3) {
-        uint i0 = state.index_buffer_reference[i + 0].element;
-        uint i1 = state.index_buffer_reference[i + 1].element;
-        uint i2 = state.index_buffer_reference[i + 2].element;
-
-        vec2 p0 = vec2(pixel);
-        vec2 p1 = state.vertex_buffer_reference[i0].element;
-        vec2 p2 = state.vertex_buffer_reference[i1].element;
-        vec2 p3 = state.vertex_buffer_reference[i2].element;
-
-        float A0 = abs(area(p1, p2, p3));
-        float A1 = abs(area(p0, p2, p3));
-        float A2 = abs(area(p1, p0, p3));
-        float A3 = abs(area(p1, p2, p0));
-
-        if (A0 == A1 + A2 + A3) {
-            imageStore(ColorImage, pixel, vec4(1, 0, 0, 1));
-        }
-    }
+    draw_triangle(
+        pixel,
+        VertexBufferReference(state.vertex_buffer_reference)[i0],
+        VertexBufferReference(state.vertex_buffer_reference)[i1],
+        VertexBufferReference(state.vertex_buffer_reference)[i2]
+    );
 }
