@@ -46,7 +46,7 @@ struct VulkanRenderer {
     u32                                         image_index = 0;
     usize                                       frame_index = 0;
 
-    VulkanRenderer(GLFWwindow* window) {
+    VulkanRenderer(void* window) {
         gpu_create_context(&context, window, loader.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr"));
 
         configuration.format = vk::Format::eB8G8R8A8Unorm;
@@ -360,9 +360,6 @@ struct VulkanRenderer {
         if (result != vk::Result::eErrorOutOfDateKHR && result != vk::Result::eSuboptimalKHR) {
             vk::resultCheck(result, "Failed to present swapchain image");
         }
-    }
-
-    void IncrementFrameIndex() {
         frame_index = (frame_index + 1) % max_frames_in_flight;
     }
 
