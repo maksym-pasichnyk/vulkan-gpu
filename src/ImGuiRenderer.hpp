@@ -48,14 +48,40 @@ public:
     }
 
     void CreateDeviceObjects() {
-        auto vertex_shader_module = vulkan->LoadShaderModule("shaders/imgui.vert.spv").value();
-        auto fragment_shader_module = vulkan->LoadShaderModule("shaders/imgui.frag.spv").value();
+        GpuShaderObject vert_shader_object;
+        GpuShaderObject frag_shader_object;
 
         auto entries = std::array{
             vk::DescriptorSetLayoutBinding(0, vk::DescriptorType::eCombinedImageSampler, 1, vk::ShaderStageFlagBits::eFragment)
         };
 
         bind_group_layout = vulkan->context.logical_device.createDescriptorSetLayout(vk::DescriptorSetLayoutCreateInfo({}, entries));
+
+        auto bind_group_layouts = std::array{
+            bind_group_layout
+        };
+
+        auto push_constant_ranges = std::array{
+            vk::PushConstantRange(vk::ShaderStageFlagBits::eVertex, 0, sizeof(f32[4]))
+        };
+
+        auto vert_bytes = vulkan->ReadBytes("shaders/imgui.vert.spv").value();
+        auto frag_bytes = vulkan->ReadBytes("shaders/imgui.frag.spv").value();
+
+        GpuShaderObjectCreateInfo vert_shader_object_info = {};
+        vert_shader_object_info.stage = vk::ShaderStageFlagBits::eVertex;
+        vert_shader_object_info.codeSize = vert_bytes.size();
+        vert_shader_object_info.pCode = vert_bytes.data();
+        vert_shader_object_info.pName = "main";
+
+        GpuShaderObjectCreateInfo frag_shader_object_info = {};
+        frag_shader_object_info.stage = vk::ShaderStageFlagBits::eFragment;
+        frag_shader_object_info.codeSize = frag_bytes.size();
+        frag_shader_object_info.pCode = frag_bytes.data();
+        frag_shader_object_info.pName = "main";
+
+        gpu_create_shader_object(&vulkan->context, &vert_shader_object, &vert_shader_object_info);
+        gpu_create_shader_object(&vulkan->context, &frag_shader_object, &frag_shader_object_info);
 
         auto bindings = std::array{
             vk::VertexInputBindingDescription(0, sizeof(ImDrawVert), vk::VertexInputRate::eVertex)
@@ -78,19 +104,13 @@ public:
                 .setColorWriteMask(vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG | vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA)
         };
 
-        auto bind_group_layouts = std::array{
-            bind_group_layout
-        };
-
-        auto push_constant_ranges = std::array{
-            vk::PushConstantRange(vk::ShaderStageFlagBits::eVertex, 0, sizeof(f32[4]))
+        auto shader_objects = std::array{
+            &vert_shader_object,
+            &frag_shader_object
         };
 
         auto state_create_info = GpuGraphicsPipelineStateCreateInfo{
-            .vertex_shader_module = vertex_shader_module,
-            .vertex_shader_entry_point = "main",
-            .fragment_shader_module = fragment_shader_module,
-            .fragment_shader_entry_point = "main",
+            .shader_objects = shader_objects,
             .rasterization_state = {
                 .cull_mode = vk::CullModeFlagBits::eNone
             },
@@ -108,16 +128,18 @@ public:
             },
             .bind_group_layouts = bind_group_layouts,
             .push_constant_ranges = push_constant_ranges,
-            .render_pass = vulkan->swapchain_render_pass,
         };
 
-        gpu_create_graphics_pipeline_state(&vulkan->context, &graphics_pipeline_state, &state_create_info, nullptr);
+        vk::PipelineRenderingCreateInfo rendering_create_info = {};
+        rendering_create_info.colorAttachmentCount = 1;
+        rendering_create_info.pColorAttachmentFormats = &vulkan->configuration.format;
+        gpu_create_graphics_pipeline_state(&vulkan->context, &graphics_pipeline_state, &state_create_info, &rendering_create_info);
 
-        vulkan->context.logical_device.destroyShaderModule(vertex_shader_module);
-        vulkan->context.logical_device.destroyShaderModule(fragment_shader_module);
+        gpu_destroy_shader_object(&vulkan->context, &vert_shader_object);
+        gpu_destroy_shader_object(&vulkan->context, &frag_shader_object);
     }
 
-    void RecordCommandBuffer(vk::CommandBuffer command_buffer, ImDrawData* draw_data) {
+    void RecordCommandBuffer(GpuCommandBuffer* command_buffer, ImDrawData* draw_data) {
         auto fb_width = static_cast<i32>(draw_data->DisplaySize.x * draw_data->FramebufferScale.x);
         auto fb_height = static_cast<i32>(draw_data->DisplaySize.y * draw_data->FramebufferScale.y);
         if (fb_width <= 0 || fb_height <= 0) {
@@ -129,18 +151,18 @@ public:
 
         if (draw_data->TotalVtxCount > 0) {
             // Create or resize the vertex/index buffers
-            if (!vulkan->GetTemporaryBuffer(&ia, draw_data->TotalVtxCount * sizeof(ImDrawVert), alignof(ImDrawVert))) {
+            if (!gpu_command_buffer_allocate(&vulkan->context, command_buffer, &ia, draw_data->TotalVtxCount * sizeof(ImDrawVert), alignof(ImDrawVert))) {
                 fprintf(stderr, "Failed to allocate vertex buffer for ImGui\n");
                 return;
             }
-            if (!vulkan->GetTemporaryBuffer(&va, draw_data->TotalIdxCount * sizeof(ImDrawIdx), alignof(ImDrawIdx))) {
+            if (!gpu_command_buffer_allocate(&vulkan->context, command_buffer, &va, draw_data->TotalIdxCount * sizeof(ImDrawIdx), alignof(ImDrawIdx))) {
                 fprintf(stderr, "Failed to allocate index buffer for ImGui\n");
                 return;
             }
 
             // Upload vertex/index data into a single contiguous GPU buffer
-            auto* vtx_dst = reinterpret_cast<ImDrawVert*>(va.allocation.mapped);
-            auto* idx_dst = reinterpret_cast<ImDrawIdx*>(ia.allocation.mapped);
+            auto* vtx_dst = reinterpret_cast<ImDrawVert*>(gpu_buffer_contents(&va));
+            auto* idx_dst = reinterpret_cast<ImDrawIdx*>(gpu_buffer_contents(&ia));
 
             for (auto cmd_list : std::span(draw_data->CmdLists, draw_data->CmdListsCount)) {
                 std::memcpy(vtx_dst, cmd_list->VtxBuffer.Data, cmd_list->VtxBuffer.Size * sizeof(ImDrawVert));
@@ -188,21 +210,10 @@ public:
                         static_cast<u32>(clip_rect.GetHeight())
                     }
                 };
-                command_buffer.setScissor(0, 1, &scissor);
+                command_buffer->cmd_buffer.setScissor(0, 1, &scissor);
 
-                vk::DescriptorSet bind_group;
+                auto bind_group = gpu_command_buffer_allocate_bind_group(&vulkan->context, command_buffer, bind_group_layout);
                 {
-                    auto allocate_info = vk::DescriptorSetAllocateInfo()
-                        .setDescriptorPool(vulkan->bind_group_allocators[vulkan->current_frame_index])
-                        .setDescriptorSetCount(1)
-                        .setPSetLayouts(&bind_group_layout);
-
-                    auto result = vulkan->context.logical_device.allocateDescriptorSets(&allocate_info, &bind_group);
-                    if (result != vk::Result::eSuccess) {
-                        fprintf(stderr, "Failed to allocate descriptor set for ImGui\n");
-                        return;
-                    }
-
                     auto p_texture = static_cast<GpuTexture*>(draw_cmd.TextureId);
 
                     auto image_info = vk::DescriptorImageInfo()
@@ -223,24 +234,24 @@ public:
                     vulkan->context.logical_device.updateDescriptorSets(writes, nullptr);
                 }
 
-                command_buffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, graphics_pipeline_state.pipeline_layout, 0, 1, &bind_group, 0, nullptr);
-                command_buffer.drawIndexed(draw_cmd.ElemCount, 1, draw_cmd.IdxOffset + global_idx_offset, static_cast<i32>(draw_cmd.VtxOffset + global_vtx_offset), 0);
+                command_buffer->cmd_buffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, graphics_pipeline_state.pipeline_layout, 0, 1, &bind_group, 0, nullptr);
+                command_buffer->cmd_buffer.drawIndexed(draw_cmd.ElemCount, 1, draw_cmd.IdxOffset + global_idx_offset, static_cast<i32>(draw_cmd.VtxOffset + global_vtx_offset), 0);
             }
             global_idx_offset += cmd_list->IdxBuffer.Size;
             global_vtx_offset += cmd_list->VtxBuffer.Size;
         }
     }
 
-    void SetupRenderState(vk::CommandBuffer command_buffer, ImDrawData* draw_data, GpuBufferInfo* va, GpuBufferInfo* ia, int fb_width, int fb_height) {
-        command_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, graphics_pipeline_state.pipeline);
+    void SetupRenderState(GpuCommandBuffer* command_buffer, ImDrawData* draw_data, GpuBufferInfo* va, GpuBufferInfo* ia, int fb_width, int fb_height) {
+        command_buffer->cmd_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, graphics_pipeline_state.pipeline);
 
         if (draw_data->TotalVtxCount > 0) {
-            command_buffer.bindVertexBuffers(0, 1, &va->buffer, &va->offset);
-            command_buffer.bindIndexBuffer(ia->buffer, ia->offset, vk::IndexType::eUint32);
+            command_buffer->cmd_buffer.bindVertexBuffers(0, 1, &va->buffer, &va->offset);
+            command_buffer->cmd_buffer.bindIndexBuffer(ia->buffer, ia->offset, vk::IndexType::eUint32);
         }
 
         auto viewport = vk::Viewport(0, 0, static_cast<f32>(fb_width), static_cast<f32>(fb_height), 0.0f, 1.0f);
-        command_buffer.setViewport(0, 1, &viewport);
+        command_buffer->cmd_buffer.setViewport(0, 1, &viewport);
 
         float scale[2];
         scale[0] = 2.0f / draw_data->DisplaySize.x;
@@ -248,7 +259,7 @@ public:
         float translate[2];
         translate[0] = -1.0f - draw_data->DisplayPos.x * scale[0];
         translate[1] = -1.0f - draw_data->DisplayPos.y * scale[1];
-        command_buffer.pushConstants(graphics_pipeline_state.pipeline_layout, vk::ShaderStageFlagBits::eVertex, sizeof(float) * 0, sizeof(float) * 2, scale);
-        command_buffer.pushConstants(graphics_pipeline_state.pipeline_layout, vk::ShaderStageFlagBits::eVertex, sizeof(float) * 2, sizeof(float) * 2, translate);
+        command_buffer->cmd_buffer.pushConstants(graphics_pipeline_state.pipeline_layout, vk::ShaderStageFlagBits::eVertex, sizeof(float) * 0, sizeof(float) * 2, scale);
+        command_buffer->cmd_buffer.pushConstants(graphics_pipeline_state.pipeline_layout, vk::ShaderStageFlagBits::eVertex, sizeof(float) * 2, sizeof(float) * 2, translate);
     }
 };

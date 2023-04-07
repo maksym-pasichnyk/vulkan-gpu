@@ -37,7 +37,6 @@ struct App {
 
     vk::DescriptorSetLayout     compute_bind_group_layout;
     GpuComputePipelineState     compute_pipeline_state;
-
     vk::DescriptorSetLayout     graphics_bind_group_layout;
     GpuGraphicsPipelineState    graphics_pipeline_state;
 
@@ -65,7 +64,6 @@ struct App {
 
         gpu_destroy_compute_pipeline_state(&vulkan->context, &compute_pipeline_state);
         gpu_destroy_graphics_pipeline_state(&vulkan->context, &graphics_pipeline_state);
-
         vulkan->context.logical_device.destroyDescriptorSetLayout(compute_bind_group_layout);
         vulkan->context.logical_device.destroyDescriptorSetLayout(graphics_bind_group_layout);
 
@@ -80,7 +78,7 @@ struct App {
 
             vulkan->WaitAndBeginNewFrame();
 
-//            EncodeRasterizer(cmd);
+            EncodeRasterizer(vulkan->current_command_buffer);
             EncodeSwapchain(vulkan->current_command_buffer);
 
             vulkan->SubmitFrameAndPresent();
@@ -121,7 +119,7 @@ struct App {
 //        return true;
     }
 
-    void EncodeRasterizer(vk::CommandBuffer cmd) {
+    void EncodeRasterizer(GpuCommandBuffer* command_buffer) {
         auto draw_data = ImGui::GetDrawData();
 
         // change image layout to General
@@ -138,7 +136,7 @@ struct App {
                     .setSubresourceRange(vk::ImageSubresourceRange(vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1)),
             };
 
-            cmd.pipelineBarrier2(vk::DependencyInfo({}, {}, {}, barriers));
+            command_buffer->cmd_buffer.pipelineBarrier2(vk::DependencyInfo({}, {}, {}, barriers));
         }
 
         // clear image
@@ -146,10 +144,10 @@ struct App {
             auto clear_value = vk::ClearColorValue(std::array{ 0.0f, 0.0f, 0.0f, 1.0f });
             auto subresource = vk::ImageSubresourceRange(vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1);
 
-            cmd.clearColorImage(color_texture.image, vk::ImageLayout::eGeneral, clear_value, subresource);
+            command_buffer->cmd_buffer.clearColorImage(color_texture.image, vk::ImageLayout::eGeneral, clear_value, subresource);
         }
 
-        auto bind_group = vulkan->GetTemporaryBindGroup(compute_bind_group_layout);
+        auto bind_group = gpu_command_buffer_allocate_bind_group(&vulkan->context, command_buffer, compute_bind_group_layout);
         {
             auto color_image_info = vk::DescriptorImageInfo()
                 .setImageView(color_texture.view)
@@ -180,8 +178,8 @@ struct App {
             vulkan->context.logical_device.updateDescriptorSets(writes, nullptr);
         }
 
-        cmd.bindPipeline(vk::PipelineBindPoint::eCompute, compute_pipeline_state.pipeline);
-        cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, compute_pipeline_state.pipeline_layout, 0, 1, &bind_group, 0, nullptr);
+        command_buffer->cmd_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, compute_pipeline_state.pipeline);
+        command_buffer->cmd_buffer.bindDescriptorSets(vk::PipelineBindPoint::eCompute, compute_pipeline_state.pipeline_layout, 0, 1, &bind_group, 0, nullptr);
 
         if (draw_data->TotalVtxCount > 0) {
             auto fb_width = static_cast<i32>(draw_data->DisplaySize.x * draw_data->FramebufferScale.x);
@@ -196,22 +194,22 @@ struct App {
 
                 GpuBufferInfo vtx_buffer_info;
                 GpuBufferInfo idx_buffer_info;
-                if (!vulkan->GetTemporaryBuffer(&vtx_buffer_info, vtx_buffer_size, alignof(ImDrawVert))) {
+                if (!gpu_command_buffer_allocate(&vulkan->context, command_buffer, &vtx_buffer_info, vtx_buffer_size, alignof(ImDrawVert))) {
                     fprintf(stderr, "Failed to allocate vertex buffer for ImGui\n");
                     continue;
                 }
 
-                if (!vulkan->GetTemporaryBuffer(&idx_buffer_info, idx_buffer_size, alignof(ImDrawIdx))) {
+                if (!gpu_command_buffer_allocate(&vulkan->context, command_buffer, &idx_buffer_info, idx_buffer_size, alignof(ImDrawIdx))) {
                     fprintf(stderr, "Failed to allocate index buffer for ImGui\n");
                     continue;
                 }
 
                 if (use_memcpy) {
-                    std::memcpy(vtx_buffer_info.allocation.mapped, cmd_list->VtxBuffer.Data, vtx_buffer_size);
-                    std::memcpy(idx_buffer_info.allocation.mapped, cmd_list->IdxBuffer.Data, idx_buffer_size);
+                    std::memcpy(gpu_buffer_contents(&vtx_buffer_info), cmd_list->VtxBuffer.Data, vtx_buffer_size);
+                    std::memcpy(gpu_buffer_contents(&idx_buffer_info), cmd_list->IdxBuffer.Data, idx_buffer_size);
                 } else {
-                    gpu_update_buffer(cmd, &vtx_buffer_info, cmd_list->VtxBuffer.Data, vtx_buffer_size);
-                    gpu_update_buffer(cmd, &idx_buffer_info, cmd_list->IdxBuffer.Data, idx_buffer_size);
+                    gpu_update_buffer(command_buffer->cmd_buffer, &vtx_buffer_info, cmd_list->VtxBuffer.Data, vtx_buffer_size);
+                    gpu_update_buffer(command_buffer->cmd_buffer, &idx_buffer_info, cmd_list->IdxBuffer.Data, idx_buffer_size);
                 }
 
                 auto viewport_scale = ImGui::GetIO().DisplayFramebufferScale;
@@ -232,8 +230,8 @@ struct App {
                     i32 group_count_y = static_cast<i32>(clip_rect.GetHeight() + 7) / 8;
                     for (u32 i = 0; i < draw_cmd.ElemCount; i += 3) {
                         auto push_constants = RasterizerPushConstants{
-                            .index_buffer_reference = idx_buffer_info.device_address,
-                            .vertex_buffer_reference = vtx_buffer_info.device_address,
+                            .index_buffer_reference = gpu_buffer_device_address(&idx_buffer_info),
+                            .vertex_buffer_reference = gpu_buffer_device_address(&vtx_buffer_info),
                             .viewport_scale = viewport_scale,
                             .index_offset = draw_cmd.IdxOffset + i,
                             .clip_rect_min_x = clip_rect.Min.x,
@@ -242,9 +240,9 @@ struct App {
                             .clip_rect_max_y = clip_rect.Max.y,
                         };
 
-                        cmd.pushConstants(compute_pipeline_state.pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push_constants), &push_constants);
+                        command_buffer->cmd_buffer.pushConstants(compute_pipeline_state.pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push_constants), &push_constants);
 
-                        cmd.dispatch(group_count_x, group_count_y, 1);
+                        command_buffer->cmd_buffer.dispatch(group_count_x, group_count_y, 1);
                     }
                 }
             }
@@ -264,11 +262,11 @@ struct App {
                     .setSubresourceRange(vk::ImageSubresourceRange(vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1)),
             };
 
-            cmd.pipelineBarrier2(vk::DependencyInfo({}, {}, {}, barriers));
+            command_buffer->cmd_buffer.pipelineBarrier2(vk::DependencyInfo({}, {}, {}, barriers));
         }
     }
 
-    void EncodeSwapchain(vk::CommandBuffer cmd) {
+    void EncodeSwapchain(GpuCommandBuffer* command_buffer) {
         auto render_area = vk::Rect2D(vk::Offset2D(0, 0), vulkan->configuration.extent);
         auto render_viewport = vk::Viewport()
             .setX(0)
@@ -278,47 +276,72 @@ struct App {
             .setMinDepth(0)
             .setMaxDepth(1);
 
-        auto clear_values = std::array{
-            vk::ClearValue(vk::ClearColorValue(std::array{0.0f, 0.0f, 0.0f, 1.0f})),
-        };
+        vk::ImageMemoryBarrier2 barriers_1[1] = {};
+        barriers_1[0].setSrcStageMask(vk::PipelineStageFlagBits2::eTopOfPipe);
+        barriers_1[0].setDstStageMask(vk::PipelineStageFlagBits2::eColorAttachmentOutput);
+        barriers_1[0].setSrcAccessMask(vk::AccessFlagBits2::eNone);
+        barriers_1[0].setDstAccessMask(vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite);
+        barriers_1[0].setOldLayout(vk::ImageLayout::eUndefined);
+        barriers_1[0].setNewLayout(vk::ImageLayout::eColorAttachmentOptimal);
+        barriers_1[0].setImage(vulkan->swapchain_images[vulkan->current_image_index]);
+        barriers_1[0].setSubresourceRange(vk::ImageSubresourceRange(vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1));
 
+        command_buffer->cmd_buffer.pipelineBarrier2(vk::DependencyInfo({}, {}, {}, barriers_1));
 
-        auto render_pass_begin_info = vk::RenderPassBeginInfo()
-            .setRenderPass(vulkan->swapchain_render_pass)
-            .setFramebuffer(vulkan->swapchain_framebuffers[vulkan->current_image_index])
-            .setRenderArea(render_area)
-            .setClearValues(clear_values);
+        vk::RenderingAttachmentInfo color_attachment_info = {};
+        color_attachment_info.setImageView(vulkan->swapchain_views[vulkan->current_image_index]);
+        color_attachment_info.setImageLayout(vk::ImageLayout::eColorAttachmentOptimal);
+        color_attachment_info.setLoadOp(vk::AttachmentLoadOp::eClear);
+        color_attachment_info.setStoreOp(vk::AttachmentStoreOp::eStore);
+        color_attachment_info.setClearValue(vk::ClearColorValue(std::array{0.0f, 0.0f, 0.0f, 1.0f}));
 
-        cmd.beginRenderPass(render_pass_begin_info, vk::SubpassContents::eInline);
-        cmd.setViewport(0, render_viewport);
-        cmd.setScissor(0, render_area);
+        vk::RenderingInfo render_info = {};
+        render_info.renderArea = render_area;
+        render_info.layerCount = 1;
+        render_info.colorAttachmentCount = 1;
+        render_info.pColorAttachments = &color_attachment_info;
 
-//        auto bind_group = vulkan->GetTemporaryBindGroup(graphics_bind_group_layout);
-//        {
-//            auto image_info = vk::DescriptorImageInfo()
-//                .setSampler(color_texture.sampler)
-//                .setImageView(color_texture.view)
-//                .setImageLayout(vk::ImageLayout::eShaderReadOnlyOptimal);
-//
-//            auto writes = std::array{
-//                vk::WriteDescriptorSet()
-//                    .setDstSet(bind_group)
-//                    .setDstBinding(0)
-//                    .setDstArrayElement(0)
-//                    .setDescriptorType(vk::DescriptorType::eCombinedImageSampler)
-//                    .setDescriptorCount(1)
-//                    .setPImageInfo(&image_info)
-//            };
-//
-//            vulkan->context.logical_device.updateDescriptorSets(writes, nullptr);
-//        }
-//        cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, graphics_pipeline_state.pipeline);
-//        cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, graphics_pipeline_state.pipeline_layout, 0, 1, &bind_group, 0, nullptr);
-//        cmd.draw(6, 1, 0, 0);
+        command_buffer->cmd_buffer.beginRendering(render_info);
+        command_buffer->cmd_buffer.setViewport(0, render_viewport);
+        command_buffer->cmd_buffer.setScissor(0, render_area);
 
-        imgui->RecordCommandBuffer(cmd, ImGui::GetDrawData());
+        auto bind_group = gpu_command_buffer_allocate_bind_group(&vulkan->context, command_buffer, graphics_bind_group_layout);
+        {
+            auto image_info = vk::DescriptorImageInfo()
+                .setSampler(color_texture.sampler)
+                .setImageView(color_texture.view)
+                .setImageLayout(vk::ImageLayout::eShaderReadOnlyOptimal);
 
-        cmd.endRenderPass();
+            auto writes = std::array{
+                vk::WriteDescriptorSet()
+                    .setDstSet(bind_group)
+                    .setDstBinding(0)
+                    .setDstArrayElement(0)
+                    .setDescriptorType(vk::DescriptorType::eCombinedImageSampler)
+                    .setDescriptorCount(1)
+                    .setPImageInfo(&image_info)
+            };
+
+            vulkan->context.logical_device.updateDescriptorSets(writes, nullptr);
+        }
+        command_buffer->cmd_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, graphics_pipeline_state.pipeline);
+        command_buffer->cmd_buffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, graphics_pipeline_state.pipeline_layout, 0, 1, &bind_group, 0, nullptr);
+        command_buffer->cmd_buffer.draw(6, 1, 0, 0);
+
+//        imgui->RecordCommandBuffer(command_buffer, ImGui::GetDrawData());
+        command_buffer->cmd_buffer.endRendering();
+
+        vk::ImageMemoryBarrier2 barriers_2[1] = {};
+        barriers_2[0].setSrcStageMask(vk::PipelineStageFlagBits2::eColorAttachmentOutput);
+        barriers_2[0].setDstStageMask(vk::PipelineStageFlagBits2::eBottomOfPipe);
+        barriers_2[0].setSrcAccessMask(vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite);
+        barriers_2[0].setDstAccessMask(vk::AccessFlagBits2::eMemoryRead);
+        barriers_2[0].setOldLayout(vk::ImageLayout::eColorAttachmentOptimal);
+        barriers_2[0].setNewLayout(vk::ImageLayout::ePresentSrcKHR);
+        barriers_2[0].setImage(vulkan->swapchain_images[vulkan->current_image_index]);
+        barriers_2[0].setSubresourceRange(vk::ImageSubresourceRange(vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1));
+
+        command_buffer->cmd_buffer.pipelineBarrier2(vk::DependencyInfo({}, {}, {}, barriers_2));
     }
 
     void CreateRenderTargets() {
@@ -373,8 +396,6 @@ struct App {
         };
         compute_bind_group_layout = vulkan->context.logical_device.createDescriptorSetLayout(vk::DescriptorSetLayoutCreateInfo({}, entries));
 
-        auto compute_shader_module = vulkan->LoadShaderModule("shaders/rasterizer.comp.spv").value();
-
         auto bind_group_layouts = std::array{
             compute_bind_group_layout
         };
@@ -383,16 +404,26 @@ struct App {
             vk::PushConstantRange(vk::ShaderStageFlagBits::eCompute, 0, sizeof(RasterizerPushConstants))
         };
 
+        auto comp_bytes = vulkan->ReadBytes("shaders/rasterizer.comp.spv").value();
+
+        GpuShaderObjectCreateInfo shader_object_infos[1] = {};
+        shader_object_infos[0].stage = vk::ShaderStageFlagBits::eCompute;
+        shader_object_infos[0].codeSize = comp_bytes.size();
+        shader_object_infos[0].pCode = comp_bytes.data();
+        shader_object_infos[0].pName = "main";
+
+        GpuShaderObject compute_shader_object;
+        gpu_create_shader_object(&vulkan->context, &compute_shader_object, &shader_object_infos[0]);
+
         auto state_create_info = GpuComputePipelineStateCreateInfo{
-            .compute_shader_module = compute_shader_module,
-            .compute_shader_entry_point = "main",
+            .shader_object = &compute_shader_object,
             .bind_group_layouts = bind_group_layouts,
             .push_constant_ranges = push_constant_ranges
         };
 
         gpu_create_compute_pipeline_state(&vulkan->context, &state_create_info, &compute_pipeline_state);
 
-        vulkan->context.logical_device.destroyShaderModule(compute_shader_module);
+        gpu_destroy_shader_object(&vulkan->context, &compute_shader_object);
     }
 
     void CreateGraphicsPipelineState() {
@@ -408,35 +439,57 @@ struct App {
                 .setColorWriteMask(vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG | vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA)
         };
 
-        auto vertex_shader_module = vulkan->LoadShaderModule("shaders/full_screen_quad.vert.spv").value();
-        auto fragment_shader_module = vulkan->LoadShaderModule("shaders/full_screen_quad.frag.spv").value();
+        auto vert_bytes = vulkan->ReadBytes("shaders/full_screen_quad.vert.spv").value();
+        auto frag_bytes = vulkan->ReadBytes("shaders/full_screen_quad.frag.spv").value();
+
+        GpuShaderObject vert_shader_object;
+        GpuShaderObject frag_shader_object;
+
+        GpuShaderObjectCreateInfo shader_object_infos[2] = {};
+        shader_object_infos[0].stage = vk::ShaderStageFlagBits::eVertex;
+        shader_object_infos[0].codeSize = vert_bytes.size();
+        shader_object_infos[0].pCode = vert_bytes.data();
+        shader_object_infos[0].pName = "main";
+
+        shader_object_infos[1].stage = vk::ShaderStageFlagBits::eFragment;
+        shader_object_infos[1].codeSize = frag_bytes.size();
+        shader_object_infos[1].pCode = frag_bytes.data();
+        shader_object_infos[1].pName = "main";
+
+        gpu_create_shader_object(&vulkan->context, &vert_shader_object, &shader_object_infos[0]);
+        gpu_create_shader_object(&vulkan->context, &frag_shader_object, &shader_object_infos[1]);
 
         auto bind_group_layouts = std::array{
             graphics_bind_group_layout
         };
 
+        auto shader_objects = std::array{
+            &vert_shader_object,
+            &frag_shader_object
+        };
+
         auto state_create_info = GpuGraphicsPipelineStateCreateInfo {
-            .vertex_shader_module        = vertex_shader_module,
-            .vertex_shader_entry_point   = "main",
-            .fragment_shader_module      = fragment_shader_module,
-            .fragment_shader_entry_point = "main",
-            .input_assembly_state        = {},
-            .rasterization_state         = {},
-            .depth_stencil_state         = {
+            .shader_objects         = shader_objects,
+            .input_assembly_state   = {},
+            .rasterization_state    = {},
+            .depth_stencil_state    = {
                 .depth_test_enable  = false,
                 .depth_write_enable = false,
             },
-            .color_blend_state           = {
+            .color_blend_state      = {
                 .attachments = attachments
             },
-            .bind_group_layouts          = bind_group_layouts,
-            .push_constant_ranges        = {},
-            .render_pass                 = vulkan->swapchain_render_pass,
+            .bind_group_layouts     = bind_group_layouts,
+            .push_constant_ranges   = {}
         };
-        gpu_create_graphics_pipeline_state(&vulkan->context, &graphics_pipeline_state, &state_create_info, nullptr);
 
-        vulkan->context.logical_device.destroyShaderModule(vertex_shader_module);
-        vulkan->context.logical_device.destroyShaderModule(fragment_shader_module);
+        vk::PipelineRenderingCreateInfo rendering_create_info = {};
+        rendering_create_info.colorAttachmentCount = 1;
+        rendering_create_info.pColorAttachmentFormats = &vulkan->configuration.format;
+        gpu_create_graphics_pipeline_state(&vulkan->context, &graphics_pipeline_state, &state_create_info, &rendering_create_info);
+
+        gpu_destroy_shader_object(&vulkan->context, &vert_shader_object);
+        gpu_destroy_shader_object(&vulkan->context, &frag_shader_object);
     }
 };
 

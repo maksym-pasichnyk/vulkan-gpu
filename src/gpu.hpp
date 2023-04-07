@@ -8,6 +8,7 @@
 #define VK_ENABLE_BETA_EXTENSIONS
 
 #include <vulkan/vulkan.hpp>
+#include <vulkan/vulkan_hash.hpp>
 
 #include "WindowPlatform.hpp"
 
@@ -71,11 +72,11 @@ struct GpuAllocation {
 };
 
 struct GpuBufferInfo {
-    vk::Buffer          buffer          = {};
-    vk::DeviceSize      size            = {};
-    vk::DeviceSize      offset          = {};
-    GpuAllocation       allocation      = {};
-    vk::DeviceAddress   device_address  = {};
+    vk::Buffer          buffer      = {};
+    vk::DeviceSize      size        = {};
+    vk::DeviceSize      offset      = {};
+    vk::DeviceAddress   address     = {};
+    GpuAllocation       allocation  = {};
 };
 
 struct GpuTexture {
@@ -85,48 +86,60 @@ struct GpuTexture {
     GpuAllocation allocation    = {};
 };
 
-struct GpuGraphicsPipelineStateCreateInfo {
-    vk::ShaderModule                vertex_shader_module        = {};
-    std::string                     vertex_shader_entry_point   = {};
-    vk::ShaderModule                fragment_shader_module      = {};
-    std::string                     fragment_shader_entry_point = {};
-    GpuInputAssemblyState           input_assembly_state        = {};
-    GpuRasterizationState           rasterization_state         = {};
-    GpuDepthStencilState            depth_stencil_state         = {};
-    GpuColorBlendState              color_blend_state           = {};
-    GpuVertexInputState             vertex_input_state          = {};
-    Slice<vk::DescriptorSetLayout>  bind_group_layouts          = {};
-    Slice<vk::PushConstantRange>    push_constant_ranges        = {};
-    vk::RenderPass                  render_pass                 = {};
-};
-
-struct GpuGraphicsPipelineState {
-    vk::Pipeline        pipeline;
-    vk::PipelineLayout  pipeline_layout;
-};
-
-struct GpuComputePipelineStateCreateInfo {
-    vk::ShaderModule                compute_shader_module       = {};
-    std::string                     compute_shader_entry_point  = {};
-    Slice<vk::DescriptorSetLayout>  bind_group_layouts          = {};
-    Slice<vk::PushConstantRange>    push_constant_ranges        = {};
-};
-
-struct GpuComputePipelineState {
-    vk::Pipeline        pipeline;
-    vk::PipelineLayout  pipeline_layout;
-};
-
-struct GpuLinearAllocator {
-    vk::Buffer          buffer;
-    vk::DeviceSize      capacity;
-    vk::DeviceSize      offset;
-    GpuAllocation       allocation;
-    vk::DeviceAddress   device_address;
+struct GpuShaderObjectCreateInfo {
+    vk::ShaderStageFlagBits         stage           = {};
+    u64                             codeSize        = {};
+    void*                           pCode           = {};
+    const char*                     pName           = {};
+    Slice<vk::DescriptorSetLayout>  set_layouts     = {};
+    Slice<vk::PushConstantRange>    push_constants  = {};
 };
 
 struct GpuShaderObject {
+    vk::ShaderStageFlagBits                 stage           = {};
+    vk::ShaderModule                        shader_module   = {};
+    std::string                             name            = {};
+    std::vector<vk::DescriptorSetLayout>    set_layouts     = {};
+    std::vector<vk::PushConstantRange>      push_constants  = {};
+};
 
+struct GpuGraphicsPipelineStateCreateInfo {
+    Slice<GpuShaderObject*>            shader_objects          = {};
+    GpuInputAssemblyState           input_assembly_state    = {};
+    GpuRasterizationState           rasterization_state     = {};
+    GpuDepthStencilState            depth_stencil_state     = {};
+    GpuColorBlendState              color_blend_state       = {};
+    GpuVertexInputState             vertex_input_state      = {};
+    Slice<vk::DescriptorSetLayout>  bind_group_layouts      = {};
+    Slice<vk::PushConstantRange>    push_constant_ranges    = {};
+};
+
+struct GpuGraphicsPipelineState {
+    vk::Pipeline        pipeline        = {};
+    vk::PipelineLayout  pipeline_layout = {};
+};
+
+struct GpuComputePipelineStateCreateInfo {
+    GpuShaderObject*                shader_object           = {};
+    Slice<vk::DescriptorSetLayout>  bind_group_layouts      = {};
+    Slice<vk::PushConstantRange>    push_constant_ranges    = {};
+};
+
+struct GpuComputePipelineState {
+    vk::Pipeline        pipeline        = {};
+    vk::PipelineLayout  pipeline_layout = {};
+};
+
+struct GpuLinearAllocator {
+    GpuBufferInfo   storage = {};
+    vk::DeviceSize  offset  = {};
+};
+
+struct GpuCommandBuffer {
+    vk::CommandPool     cmd_pool                = {};
+    vk::CommandBuffer   cmd_buffer              = {};
+    GpuLinearAllocator  buffer_allocator        = {};
+    vk::DescriptorPool  bind_group_allocator    = {};
 };
 
 struct GpuContext {
@@ -218,23 +231,45 @@ void gpu_allocate_memory(GpuContext* context, GpuAllocation* allocation, vk::Mem
     }
 }
 
-void gpu_buffer_storage(GpuContext* context, GpuAllocation* allocation, vk::Buffer buffer, GpuStorageMode gpu_storage_mode, vk::MemoryAllocateFlags memory_allocate_flags) {
-    auto memory_requirements = context->logical_device.getBufferMemoryRequirements(buffer);
-    gpu_allocate_memory(context, allocation, memory_requirements, gpu_storage_mode, memory_allocate_flags);
-    context->logical_device.bindBufferMemory(buffer, allocation->device_memory, 0);
+void gpu_free_memory(GpuContext* context, GpuAllocation* allocation) {
+    if (allocation->mapped) {
+        context->logical_device.unmapMemory(allocation->device_memory);
+    }
+    context->logical_device.freeMemory(allocation->device_memory);
+}
+
+void gpu_buffer_storage(GpuContext* context, GpuBufferInfo* info, GpuStorageMode storage_mode, vk::MemoryAllocateFlags memory_allocate_flags) {
+    auto memory_requirements = context->logical_device.getBufferMemoryRequirements(info->buffer);
+    gpu_allocate_memory(context, &info->allocation, memory_requirements, storage_mode, memory_allocate_flags);
+    context->logical_device.bindBufferMemory(info->buffer, info->allocation.device_memory, 0);
+
+    if (memory_allocate_flags & vk::MemoryAllocateFlagBits::eDeviceAddress) {
+        auto device_address_info = vk::BufferDeviceAddressInfo().setBuffer(info->buffer);
+        info->address = context->logical_device.getBufferAddress(device_address_info);
+    } else {
+        info->address = 0;
+    }
+}
+
+void gpu_buffer_destroy(GpuContext* context, GpuBufferInfo* info) {
+    if (info->buffer) {
+        context->logical_device.destroyBuffer(info->buffer);
+    }
+    gpu_free_memory(context, &info->allocation);
+}
+
+auto gpu_buffer_contents(GpuBufferInfo* buffer_info) -> void* {
+    return reinterpret_cast<u8*>(buffer_info->allocation.mapped) + buffer_info->offset;
+}
+
+auto gpu_buffer_device_address(GpuBufferInfo* buffer_info) -> vk::DeviceAddress {
+    return buffer_info->address + buffer_info->offset;
 }
 
 void gpu_texture_storage(GpuContext* context, GpuAllocation* allocation, vk::Image image, GpuStorageMode gpu_storage_mode, vk::MemoryAllocateFlags memory_allocate_flags) {
     auto memory_requirements = context->logical_device.getImageMemoryRequirements(image);
     gpu_allocate_memory(context, allocation, memory_requirements, gpu_storage_mode, memory_allocate_flags);
     context->logical_device.bindImageMemory(image, allocation->device_memory, 0);
-}
-
-void gpu_free_memory(GpuContext* context, GpuAllocation* allocation) {
-    if (allocation->mapped) {
-        context->logical_device.unmapMemory(allocation->device_memory);
-    }
-    context->logical_device.freeMemory(allocation->device_memory);
 }
 
 void gpu_create_allocator(GpuContext* context, GpuLinearAllocator* allocator, vk::DeviceSize capacity) {
@@ -255,25 +290,16 @@ void gpu_create_allocator(GpuContext* context, GpuLinearAllocator* allocator, vk
         .setUsage(buffer_usage_flags)
         .setSharingMode(vk::SharingMode::eExclusive);
 
-    allocator->buffer = context->logical_device.createBuffer(buffer_create_info);
-    allocator->capacity = capacity;
     allocator->offset = 0u;
+    allocator->storage.size = capacity;
+    allocator->storage.offset = 0;
+    vk::resultCheck(context->logical_device.createBuffer(&buffer_create_info, nullptr, &allocator->storage.buffer), "Failed to create buffer.");
 
-    vk::MemoryAllocateFlags memory_allocate_flags = {};
-    memory_allocate_flags |= vk::MemoryAllocateFlagBits::eDeviceAddress;
-
-    auto memory_requirements = context->logical_device.getBufferMemoryRequirements(allocator->buffer);
-
-    gpu_allocate_memory(context, &allocator->allocation, memory_requirements, GpuStorageMode::eShared, memory_allocate_flags);
-    context->logical_device.bindBufferMemory(allocator->buffer, allocator->allocation.device_memory, 0);
-
-    auto buffer_device_address_info = vk::BufferDeviceAddressInfo().setBuffer(allocator->buffer);
-    allocator->device_address = context->logical_device.getBufferAddress(buffer_device_address_info);
+    gpu_buffer_storage(context, &allocator->storage, GpuStorageMode::eShared, vk::MemoryAllocateFlagBits::eDeviceAddress);
 }
 
 void gpu_destroy_allocator(GpuContext* context, GpuLinearAllocator* allocator) {
-    context->logical_device.destroyBuffer(allocator->buffer);
-    gpu_free_memory(context, &allocator->allocation);
+    gpu_buffer_destroy(context, &allocator->storage);
 }
 
 void gpu_create_context(GpuContext* context, WindowPlatform* platform, PFN_vkGetInstanceProcAddr vk_get_instance_proc_addr) {
@@ -426,35 +452,33 @@ auto gpu_calculate_alignment(vk::DeviceSize offset, vk::DeviceSize alignment) ->
 
 auto gpu_allocator_allocate(GpuLinearAllocator* allocator, GpuBufferInfo* info, vk::DeviceSize size, vk::DeviceSize alignment) -> bool {
     vk::DeviceSize aligned_offset = gpu_calculate_alignment(allocator->offset, alignment);
-    if (aligned_offset + size > allocator->capacity) {
+    if (aligned_offset + size > allocator->storage.size) {
         return false;
     }
-    info->buffer            = allocator->buffer;
+    info->buffer            = allocator->storage.buffer;
     info->size              = size;
     info->offset            = aligned_offset;
-    info->allocation        = allocator->allocation;
-    info->allocation.mapped = reinterpret_cast<u8*>(allocator->allocation.mapped) + aligned_offset;
-    info->device_address    = allocator->device_address + aligned_offset;
-
+    info->address           = allocator->storage.address;
+    info->allocation        = allocator->storage.allocation;
     allocator->offset       = aligned_offset + size;
     return true;
 }
 
-void gpu_allocator_reset(GpuLinearAllocator* allocator) {
-    allocator->offset = 0;
-}
-
 void gpu_create_graphics_pipeline_state(GpuContext* context, GpuGraphicsPipelineState* state, GpuGraphicsPipelineStateCreateInfo* info, void* pNext) {
-    auto shader_stages = std::array{
-        vk::PipelineShaderStageCreateInfo()
-            .setStage(vk::ShaderStageFlagBits::eVertex)
-            .setModule(info->vertex_shader_module)
-            .setPName(info->vertex_shader_entry_point.c_str()),
-        vk::PipelineShaderStageCreateInfo()
-            .setStage(vk::ShaderStageFlagBits::eFragment)
-            .setModule(info->fragment_shader_module)
-            .setPName(info->fragment_shader_entry_point.c_str())
-    };
+    auto layout_create_info = vk::PipelineLayoutCreateInfo()
+        .setSetLayouts(info->bind_group_layouts)
+        .setPushConstantRanges(info->push_constant_ranges);
+
+    vk::resultCheck(context->logical_device.createPipelineLayout(&layout_create_info, nullptr, &state->pipeline_layout), "Failed to create pipeline layout");
+
+    std::vector<vk::PipelineShaderStageCreateInfo> shader_stages = {};
+    for (auto& shader_object : info->shader_objects) {
+        vk::PipelineShaderStageCreateInfo stage_create_info = {};
+        stage_create_info.setStage(shader_object->stage);
+        stage_create_info.setModule(shader_object->shader_module);
+        stage_create_info.setPName(shader_object->name.c_str());
+        shader_stages.emplace_back(stage_create_info);
+    }
 
     auto vertex_input_state_create_info = vk::PipelineVertexInputStateCreateInfo()
         .setVertexBindingDescriptions(info->vertex_input_state.bindings)
@@ -515,12 +539,6 @@ void gpu_create_graphics_pipeline_state(GpuContext* context, GpuGraphicsPipeline
         .setAttachments(info->color_blend_state.attachments)
         .setBlendConstants(info->color_blend_state.blend_constants);
 
-    auto layout_create_info = vk::PipelineLayoutCreateInfo()
-        .setSetLayouts(info->bind_group_layouts)
-        .setPushConstantRanges(info->push_constant_ranges);
-
-    state->pipeline_layout = context->logical_device.createPipelineLayout(layout_create_info);
-
     auto graphics_pipeline_create_info = vk::GraphicsPipelineCreateInfo()
         .setPNext(pNext)
         .setStages(shader_stages)
@@ -533,7 +551,6 @@ void gpu_create_graphics_pipeline_state(GpuContext* context, GpuGraphicsPipeline
         .setPColorBlendState(&color_blend_state_create_info)
         .setPDynamicState(&dynamic_state_create_info)
         .setLayout(state->pipeline_layout)
-        .setRenderPass(info->render_pass)
         .setSubpass(0)
         .setBasePipelineHandle(nullptr)
         .setBasePipelineIndex(-1);
@@ -548,9 +565,9 @@ void gpu_destroy_graphics_pipeline_state(GpuContext* context, GpuGraphicsPipelin
 
 void gpu_create_compute_pipeline_state(GpuContext* context, GpuComputePipelineStateCreateInfo* info, GpuComputePipelineState* state) {
     auto shader_stage_create_info = vk::PipelineShaderStageCreateInfo()
-        .setStage(vk::ShaderStageFlagBits::eCompute)
-        .setModule(info->compute_shader_module)
-        .setPName(info->compute_shader_entry_point.c_str());
+        .setStage(info->shader_object->stage)
+        .setModule(info->shader_object->shader_module)
+        .setPName(info->shader_object->name.c_str());
 
     auto layout_create_info = vk::PipelineLayoutCreateInfo()
         .setSetLayouts(info->bind_group_layouts)
@@ -586,4 +603,91 @@ void gpu_update_buffer(vk::CommandBuffer cmd, GpuBufferInfo* info, void* src, vk
     if (remaining > 0) {
         cmd.updateBuffer(info->buffer, info->offset + offset, remaining, reinterpret_cast<u8*>(src) + offset);
     }
+}
+
+void gpu_create_command_buffer(GpuContext* context, GpuCommandBuffer* command_buffer) {
+    // todo: lazy init ???
+    gpu_create_allocator(context, &command_buffer->buffer_allocator, 5ull * 1024ull * 1024ull);
+
+    auto pool_sizes = std::array{
+        vk::DescriptorPoolSize{vk::DescriptorType::eSampler, 1024},
+        vk::DescriptorPoolSize{vk::DescriptorType::eSampledImage, 1024},
+        vk::DescriptorPoolSize{vk::DescriptorType::eCombinedImageSampler, 1024},
+        vk::DescriptorPoolSize{vk::DescriptorType::eStorageImage, 1024},
+        vk::DescriptorPoolSize{vk::DescriptorType::eUniformTexelBuffer, 1024},
+        vk::DescriptorPoolSize{vk::DescriptorType::eStorageTexelBuffer, 1024},
+        vk::DescriptorPoolSize{vk::DescriptorType::eUniformBuffer, 1024},
+        vk::DescriptorPoolSize{vk::DescriptorType::eStorageBuffer, 1024},
+        vk::DescriptorPoolSize{vk::DescriptorType::eUniformBufferDynamic, 1024},
+        vk::DescriptorPoolSize{vk::DescriptorType::eStorageBufferDynamic, 1024}
+    };
+
+    vk::DescriptorPoolCreateInfo descriptor_pool_create_info = {};
+    descriptor_pool_create_info.setMaxSets(1024);
+    descriptor_pool_create_info.setPoolSizes(pool_sizes);
+
+    vk::resultCheck(context->logical_device.createDescriptorPool(&descriptor_pool_create_info, nullptr, &command_buffer->bind_group_allocator), "Failed to create descriptor pool");
+
+    vk::CommandPoolCreateInfo command_pool_create_info = {};
+    command_pool_create_info.setQueueFamilyIndex(context->graphics_queue_family_index);
+    command_pool_create_info.setFlags(vk::CommandPoolCreateFlagBits::eResetCommandBuffer);
+
+    vk::resultCheck(context->logical_device.createCommandPool(&command_pool_create_info, nullptr, &command_buffer->cmd_pool), "Failed to create command pool");
+
+    vk::CommandBufferAllocateInfo command_buffer_allocate_info = {};
+    command_buffer_allocate_info.setCommandPool(command_buffer->cmd_pool);
+    command_buffer_allocate_info.setLevel(vk::CommandBufferLevel::ePrimary);
+    command_buffer_allocate_info.setCommandBufferCount(1);
+
+    vk::resultCheck(context->logical_device.allocateCommandBuffers(&command_buffer_allocate_info, &command_buffer->cmd_buffer), "Failed to allocate command buffer");
+}
+
+void gpu_destroy_command_buffer(GpuContext* context, GpuCommandBuffer* command_buffer) {
+    gpu_destroy_allocator(context, &command_buffer->buffer_allocator);
+    context->logical_device.destroyDescriptorPool(command_buffer->bind_group_allocator);
+    context->logical_device.destroyCommandPool(command_buffer->cmd_pool);
+}
+
+void gpu_reset_command_buffer(GpuContext* context, GpuCommandBuffer* command_buffer) {
+    command_buffer->buffer_allocator.offset = 0;
+
+//    context->logical_device.resetCommandPool(command_buffer->cmd_pool, {});
+    context->logical_device.resetDescriptorPool(command_buffer->bind_group_allocator, {});
+}
+
+auto gpu_command_buffer_allocate(GpuContext* context, GpuCommandBuffer* command_buffer, GpuBufferInfo* info, vk::DeviceSize size, vk::DeviceSize alignment) -> bool {
+    return gpu_allocator_allocate(&command_buffer->buffer_allocator, info, size, alignment);
+}
+
+auto gpu_command_buffer_allocate_bind_group(GpuContext* context, GpuCommandBuffer* command_buffer, vk::DescriptorSetLayout bind_group_layout) -> vk::DescriptorSet {
+    vk::DescriptorSetAllocateInfo allocate_info = {};
+    allocate_info.setDescriptorPool(command_buffer->bind_group_allocator);
+    allocate_info.setDescriptorSetCount(1);
+    allocate_info.setPSetLayouts(&bind_group_layout);
+
+    vk::DescriptorSet bind_group;
+    vk::resultCheck(context->logical_device.allocateDescriptorSets(&allocate_info, &bind_group), "Failed to allocate descriptor set");
+    return bind_group;
+}
+
+void gpu_create_shader_object(GpuContext* context, GpuShaderObject* shader_object, const GpuShaderObjectCreateInfo* create_info) {
+    vk::ShaderModuleCreateInfo module_create_info = {};
+    module_create_info.setCodeSize(create_info->codeSize);
+    module_create_info.setPCode(reinterpret_cast<const u32*>(create_info->pCode));
+
+    vk::ShaderModule shader_module;
+    vk::resultCheck(context->logical_device.createShaderModule(&module_create_info, nullptr, &shader_module), "Failed to create shader module");
+
+    shader_object->stage = create_info->stage;
+    shader_object->shader_module = shader_module;
+    shader_object->name = create_info->pName;
+    shader_object->set_layouts.assign(create_info->set_layouts.begin(), create_info->set_layouts.end());
+    shader_object->push_constants.assign(create_info->push_constants.begin(), create_info->push_constants.end());
+}
+
+void gpu_destroy_shader_object(GpuContext* context, GpuShaderObject* shader_object) {
+    shader_object->name.clear();
+    shader_object->set_layouts.clear();
+    shader_object->push_constants.clear();
+    context->logical_device.destroyShaderModule(shader_object->shader_module);
 }

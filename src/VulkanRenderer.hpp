@@ -21,30 +21,24 @@ class VulkanRenderer : public ManagedObject {
 public:
     i32 max_frames_in_flight = 3;
 
-    vk::DynamicLoader                           loader;
-    GpuContext                                  context;
+    vk::DynamicLoader               loader;
+    GpuContext                      context;
 
-    vk::SwapchainKHR                            swapchain;
-    SurfaceConfiguration                        configuration;
+    vk::SwapchainKHR                swapchain;
+    SurfaceConfiguration            configuration;
 
-    std::vector<vk::Image>                      swapchain_images;
-    std::vector<vk::ImageView>                  swapchain_views;
+    std::vector<vk::Image>          swapchain_images;
+    std::vector<vk::ImageView>      swapchain_views;
 
-    vk::RenderPass                              swapchain_render_pass;
-    std::vector<vk::Framebuffer>                swapchain_framebuffers;
+    std::vector<vk::Fence>          in_flight_fences;
+    std::vector<vk::Semaphore>      image_available_semaphores;
+    std::vector<vk::Semaphore>      render_finished_semaphores;
 
-    std::vector<vk::Fence>                      in_flight_fences;
-    std::vector<vk::Semaphore>                  image_available_semaphores;
-    std::vector<vk::Semaphore>                  render_finished_semaphores;
-
-    std::vector<vk::CommandPool>                command_pools;
-    std::vector<GpuLinearAllocator>             frame_allocators;
-    std::vector<vk::DescriptorPool>             bind_group_allocators;
-
-    u32                                         current_image_index = 0;
-    usize                                       current_frame_index = 0;
-
-    vk::CommandBuffer                           current_command_buffer = {};
+    std::vector<GpuCommandBuffer>   command_buffers;
+    
+    u32                             current_image_index = 0;
+    usize                           current_frame_index = 0;
+    GpuCommandBuffer*               current_command_buffer = {};
 
 public:
     VulkanRenderer(WindowPlatform* platform) {
@@ -54,54 +48,6 @@ public:
         configuration.color_space = vk::ColorSpaceKHR::eSrgbNonlinear;
         configuration.min_image_count = 3u;
 
-        auto attachments = std::array{
-            vk::AttachmentDescription()
-                .setFormat(configuration.format)
-                .setSamples(vk::SampleCountFlagBits::e1)
-                .setLoadOp(vk::AttachmentLoadOp::eClear)
-                .setStoreOp(vk::AttachmentStoreOp::eStore)
-                .setStencilLoadOp(vk::AttachmentLoadOp::eDontCare)
-                .setStencilStoreOp(vk::AttachmentStoreOp::eDontCare)
-                .setInitialLayout(vk::ImageLayout::eUndefined)
-                .setFinalLayout(vk::ImageLayout::ePresentSrcKHR)
-        };
-
-        auto color_attachment_references = std::array{
-            vk::AttachmentReference()
-                .setAttachment(0)
-                .setLayout(vk::ImageLayout::eColorAttachmentOptimal)
-        };
-
-        auto subpasses = std::array{
-            vk::SubpassDescription()
-                .setPipelineBindPoint(vk::PipelineBindPoint::eGraphics)
-                .setColorAttachments(color_attachment_references)
-        };
-
-        auto dependencies = std::array{
-            vk::SubpassDependency()
-                .setSrcSubpass(VK_SUBPASS_EXTERNAL)
-                .setDstSubpass(0)
-                .setSrcStageMask(vk::PipelineStageFlagBits::eColorAttachmentOutput)
-                .setSrcAccessMask(vk::AccessFlags())
-                .setDstStageMask(vk::PipelineStageFlagBits::eColorAttachmentOutput)
-                .setDstAccessMask(vk::AccessFlagBits::eColorAttachmentRead | vk::AccessFlagBits::eColorAttachmentWrite),
-            vk::SubpassDependency()
-                .setSrcSubpass(0)
-                .setDstSubpass(VK_SUBPASS_EXTERNAL)
-                .setSrcStageMask(vk::PipelineStageFlagBits::eColorAttachmentOutput)
-                .setSrcAccessMask(vk::AccessFlagBits::eColorAttachmentRead | vk::AccessFlagBits::eColorAttachmentWrite)
-                .setDstStageMask(vk::PipelineStageFlagBits::eColorAttachmentOutput)
-                .setDstAccessMask(vk::AccessFlags()),
-        };
-
-        auto render_pass_create_info = vk::RenderPassCreateInfo()
-            .setAttachments(attachments)
-            .setSubpasses(subpasses)
-            .setDependencies(dependencies);
-
-        swapchain_render_pass = context.logical_device.createRenderPass(render_pass_create_info);
-
         ConfigureSwapchain();
         CreateDeviceResources();
     }
@@ -110,41 +56,17 @@ public:
         CleanupDeviceResources();
         CleanupSwapchain();
 
-        context.logical_device.destroyRenderPass(swapchain_render_pass);
         gpu_destroy_context(&context);
     }
 
     void CreateDeviceResources() {
-        command_pools.resize(max_frames_in_flight);
-        frame_allocators.resize(max_frames_in_flight);
-        bind_group_allocators.resize(max_frames_in_flight);
-
+        command_buffers.resize(max_frames_in_flight);
         in_flight_fences.resize(max_frames_in_flight);
         image_available_semaphores.resize(max_frames_in_flight);
         render_finished_semaphores.resize(max_frames_in_flight);
 
-        auto pool_sizes = std::array{
-            vk::DescriptorPoolSize{vk::DescriptorType::eSampler, 1024},
-            vk::DescriptorPoolSize{vk::DescriptorType::eSampledImage, 1024},
-            vk::DescriptorPoolSize{vk::DescriptorType::eCombinedImageSampler, 1024},
-            vk::DescriptorPoolSize{vk::DescriptorType::eStorageImage, 1024},
-            vk::DescriptorPoolSize{vk::DescriptorType::eUniformTexelBuffer, 1024},
-            vk::DescriptorPoolSize{vk::DescriptorType::eStorageTexelBuffer, 1024},
-            vk::DescriptorPoolSize{vk::DescriptorType::eUniformBuffer, 1024},
-            vk::DescriptorPoolSize{vk::DescriptorType::eStorageBuffer, 1024},
-            vk::DescriptorPoolSize{vk::DescriptorType::eUniformBufferDynamic, 1024},
-            vk::DescriptorPoolSize{vk::DescriptorType::eStorageBufferDynamic, 1024}
-        };
-
-        vk::CommandPoolCreateInfo command_pool_create_info = {};
-        command_pool_create_info.setQueueFamilyIndex(context.graphics_queue_family_index);
-        command_pool_create_info.setFlags(vk::CommandPoolCreateFlagBits::eResetCommandBuffer);
-
         for (size_t i = 0; i < max_frames_in_flight; i++) {
-            gpu_create_allocator(&context, &frame_allocators[i], 5ull * 1024ull * 1024ull);
-
-            command_pools[i] = context.logical_device.createCommandPool(command_pool_create_info);
-            bind_group_allocators[i] = context.logical_device.createDescriptorPool(vk::DescriptorPoolCreateInfo({}, 1024, pool_sizes));
+            gpu_create_command_buffer(&context, &command_buffers[i]);
 
             in_flight_fences[i] = context.logical_device.createFence(vk::FenceCreateInfo(vk::FenceCreateFlagBits::eSignaled));
             image_available_semaphores[i] = context.logical_device.createSemaphore(vk::SemaphoreCreateInfo());
@@ -154,10 +76,7 @@ public:
 
     void CleanupDeviceResources() {
         for (size_t i = 0; i < max_frames_in_flight; i++) {
-            gpu_destroy_allocator(&context, &frame_allocators[i]);
-
-            context.logical_device.destroyCommandPool(command_pools[i]);
-            context.logical_device.destroyDescriptorPool(bind_group_allocators[i]);
+            gpu_destroy_command_buffer(&context, &command_buffers[i]);
 
             context.logical_device.destroyFence(in_flight_fences[i]);
             context.logical_device.destroySemaphore(image_available_semaphores[i]);
@@ -199,7 +118,7 @@ public:
         swapchain_images = context.logical_device.getSwapchainImagesKHR(swapchain);
 
         swapchain_views.resize(swapchain_images.size());
-        swapchain_framebuffers.resize(swapchain_images.size());
+//        swapchain_framebuffers.resize(swapchain_images.size());
 
         for (size_t i = 0; i < swapchain_images.size(); i++) {
             vk::ImageViewCreateInfo image_view_info = {};
@@ -209,26 +128,13 @@ public:
             image_view_info.setSubresourceRange(vk::ImageSubresourceRange(vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1));
 
             vk::resultCheck(context.logical_device.createImageView(&image_view_info, nullptr, &swapchain_views[i]), "Failed to create image view");
-
-            auto attachments = std::array{
-                swapchain_views[i]
-            };
-
-            auto framebuffer_create_info = vk::FramebufferCreateInfo()
-                .setRenderPass(swapchain_render_pass)
-                .setAttachments(attachments)
-                .setWidth(configuration.extent.width)
-                .setHeight(configuration.extent.height)
-                .setLayers(1);
-
-            swapchain_framebuffers[i] = context.logical_device.createFramebuffer(framebuffer_create_info);
         }
     }
 
     void CleanupSwapchain() {
         for (size_t i = 0; i < swapchain_images.size(); i++) {
             context.logical_device.destroyImageView(swapchain_views[i]);
-            context.logical_device.destroyFramebuffer(swapchain_framebuffers[i]);
+//            context.logical_device.destroyFramebuffer(swapchain_framebuffers[i]);
         }
         context.logical_device.destroySwapchainKHR(swapchain);
     }
@@ -248,23 +154,14 @@ public:
             vk::resultCheck(result, "Failed to acquire swapchain image");
         }
 
-        gpu_allocator_reset(&frame_allocators[current_frame_index]);
+        current_command_buffer = &command_buffers[current_frame_index];
 
-        context.logical_device.resetCommandPool(command_pools[current_frame_index], {});
-        context.logical_device.resetDescriptorPool(bind_group_allocators[current_frame_index]);
-
-        vk::CommandBufferAllocateInfo command_buffer_allocate_info = {};
-        command_buffer_allocate_info.setCommandPool(command_pools[current_frame_index]);
-        command_buffer_allocate_info.setLevel(vk::CommandBufferLevel::ePrimary);
-        command_buffer_allocate_info.setCommandBufferCount(1);
-
-        vk::resultCheck(context.logical_device.allocateCommandBuffers(&command_buffer_allocate_info, &current_command_buffer), "Failed to allocate command buffers.");
-
-        current_command_buffer.begin(vk::CommandBufferBeginInfo(vk::CommandBufferUsageFlagBits::eOneTimeSubmit));
+        gpu_reset_command_buffer(&context, current_command_buffer);
+        current_command_buffer->cmd_buffer.begin(vk::CommandBufferBeginInfo(vk::CommandBufferUsageFlagBits::eOneTimeSubmit));
     }
 
     void SubmitFrameAndPresent() {
-        current_command_buffer.end();
+        current_command_buffer->cmd_buffer.end();
 
         auto wait_stages = std::array{
             vk::PipelineStageFlags(vk::PipelineStageFlagBits::eColorAttachmentOutput)
@@ -275,7 +172,7 @@ public:
             .setPWaitSemaphores(&image_available_semaphores[current_frame_index])
             .setPWaitDstStageMask(wait_stages.data())
             .setCommandBufferCount(1)
-            .setPCommandBuffers(&current_command_buffer)
+            .setPCommandBuffers(&current_command_buffer->cmd_buffer)
             .setSignalSemaphoreCount(1)
             .setPSignalSemaphores(&render_finished_semaphores[current_frame_index]);
 
@@ -293,38 +190,16 @@ public:
         if (result != vk::Result::eErrorOutOfDateKHR && result != vk::Result::eSuboptimalKHR) {
             vk::resultCheck(result, "Failed to present swapchain image");
         }
-
         current_frame_index = (current_frame_index + 1) % max_frames_in_flight;
     }
 
-    auto GetTemporaryBuffer(GpuBufferInfo* info, vk::DeviceSize size, vk::DeviceSize alignment) -> bool {
-        return gpu_allocator_allocate(&frame_allocators[current_frame_index], info, size, alignment);
-    }
-
-    auto GetTemporaryBindGroup(vk::DescriptorSetLayout bind_group_layout) -> vk::DescriptorSet {
-        vk::DescriptorSetAllocateInfo allocate_info = {};
-        allocate_info.setDescriptorPool(bind_group_allocators[current_frame_index]);
-        allocate_info.setDescriptorSetCount(1);
-        allocate_info.setPSetLayouts(&bind_group_layout);
-
-        vk::DescriptorSet bind_group;
-        vk::resultCheck(context.logical_device.allocateDescriptorSets(&allocate_info, &bind_group), "Failed to allocate descriptor set");
-        return bind_group;
-    }
-
-    auto LoadShaderModule(const std::string& filename) -> Result<vk::ShaderModule, std::runtime_error> {
+    auto ReadBytes(const std::string& filename) -> Result<std::vector<char>, std::runtime_error> {
         std::ifstream file(filename, std::ios::binary);
         if (!file.is_open()) {
             return std::runtime_error("Failed to open file");
         }
 
-        std::vector<char> code(std::istreambuf_iterator<char>(file), {});
-
-        vk::ShaderModuleCreateInfo create_info = {};
-        create_info.setCodeSize(code.size());
-        create_info.setPCode(reinterpret_cast<const u32*>(code.data()));
-
-        return context.logical_device.createShaderModule(create_info);
+        return std::vector(std::istreambuf_iterator<char>(file), {});
     }
 
     void CreateTextureFromMemory(GpuTexture* texture, u32 width, u32 height, void* pixels) {
@@ -375,35 +250,15 @@ public:
 //        // TODO: simplify this
         auto size_in_bytes = static_cast<vk::DeviceSize>(width * height * 4);
         {
+            GpuCommandBuffer command_buffer;
+            gpu_create_command_buffer(&context, &command_buffer);
 
-            auto buffer_create_info = vk::BufferCreateInfo()
-                .setSize(size_in_bytes)
-                .setUsage(vk::BufferUsageFlagBits::eTransferSrc)
-                .setSharingMode(vk::SharingMode::eExclusive);
+            GpuBufferInfo tmp;
+            gpu_command_buffer_allocate(&context, &command_buffer, &tmp, size_in_bytes, context.physical_device.getProperties().limits.optimalBufferCopyOffsetAlignment);
 
-            vk::Buffer tmp_buf;
-            vk::resultCheck(context.logical_device.createBuffer(&buffer_create_info, nullptr, &tmp_buf), "Failed to create buffer");
+            std::memcpy(gpu_buffer_contents(&tmp), pixels, size_in_bytes);
 
-            GpuAllocation tmp_mem;
-            gpu_buffer_storage(&context, &tmp_mem, tmp_buf, GpuStorageMode::eShared, {});
-
-            std::memcpy(tmp_mem.mapped, pixels, size_in_bytes);
-
-            vk::CommandPoolCreateInfo cmd_pool_info = {};
-            cmd_pool_info.setQueueFamilyIndex(context.graphics_queue_family_index);
-            cmd_pool_info.setFlags(vk::CommandPoolCreateFlagBits::eResetCommandBuffer);
-
-            auto cmd_pool = context.logical_device.createCommandPool(cmd_pool_info);
-
-            auto cmd_allocate_info = vk::CommandBufferAllocateInfo()
-                .setCommandPool(cmd_pool)
-                .setLevel(vk::CommandBufferLevel::ePrimary)
-                .setCommandBufferCount(1);
-
-            vk::CommandBuffer cmd;
-            vk::resultCheck(context.logical_device.allocateCommandBuffers(&cmd_allocate_info, &cmd), "Failed to allocate command buffer");
-            cmd.begin(vk::CommandBufferBeginInfo(vk::CommandBufferUsageFlagBits::eOneTimeSubmit));
-
+            command_buffer.cmd_buffer.begin(vk::CommandBufferBeginInfo(vk::CommandBufferUsageFlagBits::eOneTimeSubmit));
             {
                 auto barriers = std::array{
                     vk::ImageMemoryBarrier2()
@@ -418,30 +273,15 @@ public:
                         .setImage(texture->image)
                         .setSubresourceRange(vk::ImageSubresourceRange(vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1)),
                 };
-                cmd.pipelineBarrier2(vk::DependencyInfo({}, {}, {}, barriers));
+                command_buffer.cmd_buffer.pipelineBarrier2(vk::DependencyInfo({}, {}, {}, barriers));
             }
 
-//            vk::BufferImageCopy2 copy_region = {};
-//            copy_region.setBufferOffset(0);
-//            copy_region.setBufferRowLength(0);
-//            copy_region.setBufferImageHeight(0);
-//            copy_region.setImageOffset(vk::Offset3D(0, 0, 0));
-//            copy_region.setImageExtent(vk::Extent3D(width, height, 1));
-//            copy_region.setImageSubresource(vk::ImageSubresourceLayers(vk::ImageAspectFlagBits::eColor, 0, 0, 1));
-//
-//            vk::CopyBufferToImageInfo2 copy_info = {};
-//            copy_info.dstImage = texture->image;
-//            copy_info.dstImageLayout = vk::ImageLayout::eTransferDstOptimal;
-//            copy_info.regionCount = 1;
-//            copy_info.pRegions = &copy_region;
-//
-//            cmd.copyBufferToImage2(copy_info);
-
             auto region = vk::BufferImageCopy()
+                .setBufferOffset(tmp.offset)
                 .setImageSubresource(vk::ImageSubresourceLayers(vk::ImageAspectFlagBits::eColor, 0, 0, 1))
                 .setImageExtent(vk::Extent3D(width, height, 1));
 
-            cmd.copyBufferToImage(tmp_buf, texture->image, vk::ImageLayout::eTransferDstOptimal, 1, &region);
+            command_buffer.cmd_buffer.copyBufferToImage(tmp.buffer, texture->image, vk::ImageLayout::eTransferDstOptimal, 1, &region);
 
             {
                 auto barriers = std::array{
@@ -457,20 +297,19 @@ public:
                         .setImage(texture->image)
                         .setSubresourceRange(vk::ImageSubresourceRange(vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1)),
                 };
-                cmd.pipelineBarrier2(vk::DependencyInfo({}, {}, {}, barriers));
+                command_buffer.cmd_buffer.pipelineBarrier2(vk::DependencyInfo({}, {}, {}, barriers));
             }
-            cmd.end();
+
+            command_buffer.cmd_buffer.end();
 
             auto fence = context.logical_device.createFence(vk::FenceCreateInfo());
-            auto submit_info = vk::SubmitInfo(0, nullptr, nullptr, 1, &cmd, 0, nullptr);
+            auto submit_info = vk::SubmitInfo(0, nullptr, nullptr, 1, &command_buffer.cmd_buffer, 0, nullptr);
 
             vk::resultCheck(context.graphics_queue.submit(1, &submit_info, fence), "Failed to submit command buffer");
             vk::resultCheck(context.logical_device.waitForFences(1, &fence, VK_TRUE, UINT64_MAX), "Failed to wait for fence");
             context.logical_device.destroyFence(fence);
-            context.logical_device.destroyBuffer(tmp_buf);
-            gpu_free_memory(&context, &tmp_mem);
 
-            context.logical_device.destroyCommandPool(cmd_pool);
+            gpu_destroy_command_buffer(&context, &command_buffer);
         }
     }
 

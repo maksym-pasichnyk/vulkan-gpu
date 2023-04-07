@@ -5,7 +5,8 @@
 #pragma once
 
 class ManagedObject {
-public:
+protected:
+    explicit ManagedObject() : _refs(1) {}
     virtual ~ManagedObject() = default;
 
 public:
@@ -20,5 +21,5 @@ public:
     }
 
 private:
-    std::atomic_uint64_t _refs = 0;
+    std::atomic_uint64_t _refs;
 };
