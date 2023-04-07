@@ -5,35 +5,32 @@
 #pragma once
 
 #include "VulkanRenderer.hpp"
+#include "ManagedObject.hpp"
 
 #include <imgui_internal.h>
 #include <backends/imgui_impl_glfw.h>
 #include <backends/imgui_impl_vulkan.h>
 
-struct ImGuiRenderer {
+class ImGuiRenderer : public ManagedObject {
+public:
     VulkanRenderer* vulkan;
     GpuTexture texture;
 
     vk::DescriptorSetLayout bind_group_layout;
     GpuGraphicsPipelineState graphics_pipeline_state;
 
-    ImGuiRenderer(VulkanRenderer* vulkan, void* window) : vulkan(vulkan) {
-        ImGui::CreateContext();
-
-        ImGui_ImplGlfw_InitForVulkan(static_cast<GLFWwindow*>(window), true);
-//        ImGui_ImplSDL2_InitForVulkan(static_cast<SDL_Window*>(window));
-
+public:
+    explicit ImGuiRenderer(VulkanRenderer* vulkan) : vulkan(vulkan) {
         CreateFontTexture();
         CreateDeviceObjects();
     }
 
-    ~ImGuiRenderer() {
+    ~ImGuiRenderer() override {
         vulkan->context.logical_device.destroyDescriptorSetLayout(bind_group_layout);
         vulkan->CleanupTexture(&texture);
 
         gpu_destroy_graphics_pipeline_state(&vulkan->context, &graphics_pipeline_state);
 
-//        ImGui_ImplSDL2_Shutdown();
         ImGui_ImplGlfw_Shutdown();
         ImGui::DestroyContext();
     }
@@ -120,7 +117,7 @@ struct ImGuiRenderer {
         vulkan->context.logical_device.destroyShaderModule(fragment_shader_module);
     }
 
-    void RenderDrawData(vk::CommandBuffer command_buffer, ImDrawData* draw_data) {
+    void RecordCommandBuffer(vk::CommandBuffer command_buffer, ImDrawData* draw_data) {
         auto fb_width = static_cast<i32>(draw_data->DisplaySize.x * draw_data->FramebufferScale.x);
         auto fb_height = static_cast<i32>(draw_data->DisplaySize.y * draw_data->FramebufferScale.y);
         if (fb_width <= 0 || fb_height <= 0) {
@@ -132,18 +129,19 @@ struct ImGuiRenderer {
 
         if (draw_data->TotalVtxCount > 0) {
             // Create or resize the vertex/index buffers
-            if (!vulkan->AllocateTemporary(&ia, draw_data->TotalVtxCount * sizeof(ImDrawVert), alignof(ImDrawVert))) {
+            if (!vulkan->GetTemporaryBuffer(&ia, draw_data->TotalVtxCount * sizeof(ImDrawVert), alignof(ImDrawVert))) {
                 fprintf(stderr, "Failed to allocate vertex buffer for ImGui\n");
                 return;
             }
-            if (!vulkan->AllocateTemporary(&va, draw_data->TotalIdxCount * sizeof(ImDrawIdx), alignof(ImDrawIdx))) {
+            if (!vulkan->GetTemporaryBuffer(&va, draw_data->TotalIdxCount * sizeof(ImDrawIdx), alignof(ImDrawIdx))) {
                 fprintf(stderr, "Failed to allocate index buffer for ImGui\n");
                 return;
             }
 
             // Upload vertex/index data into a single contiguous GPU buffer
-            auto* vtx_dst = static_cast<ImDrawVert*>(va.mapped);
-            auto* idx_dst = static_cast<ImDrawIdx*>(ia.mapped);
+            auto* vtx_dst = reinterpret_cast<ImDrawVert*>(va.allocation.mapped);
+            auto* idx_dst = reinterpret_cast<ImDrawIdx*>(ia.allocation.mapped);
+
             for (auto cmd_list : std::span(draw_data->CmdLists, draw_data->CmdListsCount)) {
                 std::memcpy(vtx_dst, cmd_list->VtxBuffer.Data, cmd_list->VtxBuffer.Size * sizeof(ImDrawVert));
                 std::memcpy(idx_dst, cmd_list->IdxBuffer.Data, cmd_list->IdxBuffer.Size * sizeof(ImDrawIdx));
@@ -195,7 +193,7 @@ struct ImGuiRenderer {
                 vk::DescriptorSet bind_group;
                 {
                     auto allocate_info = vk::DescriptorSetAllocateInfo()
-                        .setDescriptorPool(vulkan->bind_group_allocators[vulkan->frame_index])
+                        .setDescriptorPool(vulkan->bind_group_allocators[vulkan->current_frame_index])
                         .setDescriptorSetCount(1)
                         .setPSetLayouts(&bind_group_layout);
 

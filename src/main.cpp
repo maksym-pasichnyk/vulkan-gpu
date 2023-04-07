@@ -1,11 +1,9 @@
+#include "WindowPlatform.hpp"
 #include "VulkanRenderer.hpp"
 #include "ImGuiRenderer.hpp"
 
-//#include <SDL_video.h>
-//#include <SDL_events.h>
 #include <imgui_demo.cpp>
 #include <backends/imgui_impl_glfw.cpp>
-//#include <backends/imgui_impl_sdl2.cpp>
 
 vk::DispatchLoaderDynamic vk::defaultDispatchLoaderDynamic;
 
@@ -24,50 +22,56 @@ struct float2 {
     float x, y;
 };
 
+struct float3 {
+    float x, y, z;
+};
+
 struct float4 {
     float x, y, z, w;
 };
 
 struct App {
-//    SDL_Window*     window;
-    GLFWwindow*     window;
-    VulkanRenderer* vulkan;
-    ImGuiRenderer*  imgui;
+    WindowPlatform*             platform;
+    VulkanRenderer*             vulkan;
+    ImGuiRenderer*              imgui;
 
-    vk::DescriptorSetLayout compute_bind_group_layout;
-    GpuComputePipelineState compute_pipeline_state;
+    vk::DescriptorSetLayout     compute_bind_group_layout;
+    GpuComputePipelineState     compute_pipeline_state;
 
-    vk::DescriptorSetLayout  graphics_bind_group_layout;
-    GpuGraphicsPipelineState graphics_pipeline_state;
+    vk::DescriptorSetLayout     graphics_bind_group_layout;
+    GpuGraphicsPipelineState    graphics_pipeline_state;
+
+    GpuTexture                  color_texture;
 
     bool use_memcpy = false;
 
     App() {
-//        window = SDL_CreateWindow("Hello, world!", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 800, 600, SDL_WINDOW_VULKAN | SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_RESIZABLE);
+//        glfwInitVulkanLoader(vulkan->loader.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr"));
+        platform = new WindowPlatform("Vulkan window", 800, 600);
+        vulkan = new VulkanRenderer(platform);
 
-        //glfwInitVulkanLoader(vulkan->loader.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr"));
-        glfwInit();
-        glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-        window = glfwCreateWindow(800, 600, "Vulkan window", nullptr, nullptr);
-        vulkan = new VulkanRenderer(window);
-        imgui = new ImGuiRenderer(vulkan, window);
+        ImGui::CreateContext();
+        ImGui_ImplGlfw_InitForVulkan(static_cast<GLFWwindow*>(platform->GetNativeWindow()), true);
 
+        imgui = new ImGuiRenderer(vulkan);
+
+        CreateRenderTargets();
         CreateComputePipelineState();
         CreateGraphicsPipelineState();
     }
 
     ~App() {
+        vulkan->CleanupTexture(&color_texture);
+
         gpu_destroy_compute_pipeline_state(&vulkan->context, &compute_pipeline_state);
         gpu_destroy_graphics_pipeline_state(&vulkan->context, &graphics_pipeline_state);
 
         vulkan->context.logical_device.destroyDescriptorSetLayout(compute_bind_group_layout);
         vulkan->context.logical_device.destroyDescriptorSetLayout(graphics_bind_group_layout);
 
-        delete imgui;
-        delete vulkan;
-
-        glfwDestroyWindow(window);
-//        SDL_DestroyWindow(window);
+        imgui->release();
+        vulkan->release();
+        platform->release();
     }
 
     void Start() {
@@ -76,13 +80,10 @@ struct App {
 
             vulkan->WaitAndBeginNewFrame();
 
-            auto cmd = vulkan->command_buffers[vulkan->frame_index];
-
-            EncodeRasterizer(cmd);
-            EncodeSwapchain(cmd);
+//            EncodeRasterizer(cmd);
+            EncodeSwapchain(vulkan->current_command_buffer);
 
             vulkan->SubmitFrameAndPresent();
-            vulkan->IncrementFrameIndex();
         }
 
         vulkan->context.logical_device.waitIdle();
@@ -103,8 +104,7 @@ struct App {
     }
 
     auto PumpEvents() -> bool {
-        glfwPollEvents();
-        return !glfwWindowShouldClose(window);
+        return platform->PumpEvents();
 
 //        SDL_Event event;
 //        while (SDL_PollEvent(&event)) {
@@ -121,22 +121,6 @@ struct App {
 //        return true;
     }
 
-    void UpdateBuffer(vk::CommandBuffer cmd, GpuBufferInfo* info, void* src, vk::DeviceSize size) {
-        vk::DeviceSize max_data_size = 65536;
-        vk::DeviceSize remaining = size;
-        vk::DeviceSize offset = 0;
-
-        while (remaining > max_data_size) {
-            cmd.updateBuffer(info->buffer, info->offset + offset, max_data_size, reinterpret_cast<u8*>(src) + offset);
-            remaining -= max_data_size;
-            offset += max_data_size;
-        }
-
-        if (remaining > 0) {
-            cmd.updateBuffer(info->buffer, info->offset + offset, remaining, reinterpret_cast<u8*>(src) + offset);
-        }
-    }
-
     void EncodeRasterizer(vk::CommandBuffer cmd) {
         auto draw_data = ImGui::GetDrawData();
 
@@ -150,7 +134,7 @@ struct App {
                     .setDstAccessMask(vk::AccessFlagBits2::eShaderWrite)
                     .setOldLayout(vk::ImageLayout::eUndefined)
                     .setNewLayout(vk::ImageLayout::eGeneral)
-                    .setImage(vulkan->color_textures[vulkan->image_index].image)
+                    .setImage(color_texture.image)
                     .setSubresourceRange(vk::ImageSubresourceRange(vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1)),
             };
 
@@ -162,24 +146,13 @@ struct App {
             auto clear_value = vk::ClearColorValue(std::array{ 0.0f, 0.0f, 0.0f, 1.0f });
             auto subresource = vk::ImageSubresourceRange(vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1);
 
-            cmd.clearColorImage(vulkan->color_textures[vulkan->image_index].image, vk::ImageLayout::eGeneral, clear_value, subresource);
+            cmd.clearColorImage(color_texture.image, vk::ImageLayout::eGeneral, clear_value, subresource);
         }
 
-        vk::DescriptorSet bind_group;
+        auto bind_group = vulkan->GetTemporaryBindGroup(compute_bind_group_layout);
         {
-            auto allocate_info = vk::DescriptorSetAllocateInfo()
-                .setDescriptorPool(vulkan->bind_group_allocators[vulkan->frame_index])
-                .setDescriptorSetCount(1)
-                .setPSetLayouts(&compute_bind_group_layout);
-
-            auto result = vulkan->context.logical_device.allocateDescriptorSets(&allocate_info, &bind_group);
-            if (result != vk::Result::eSuccess) {
-                fprintf(stderr, "Failed to allocate descriptor set %s\n", vk::to_string(result).c_str());
-                exit(1);
-            }
-
             auto color_image_info = vk::DescriptorImageInfo()
-                .setImageView(vulkan->color_textures[vulkan->image_index].view)
+                .setImageView(color_texture.view)
                 .setImageLayout(vk::ImageLayout::eGeneral);
 
             auto texture_image_info = vk::DescriptorImageInfo()
@@ -223,22 +196,22 @@ struct App {
 
                 GpuBufferInfo vtx_buffer_info;
                 GpuBufferInfo idx_buffer_info;
-                if (!vulkan->AllocateTemporary(&vtx_buffer_info, vtx_buffer_size, alignof(ImDrawVert))) {
+                if (!vulkan->GetTemporaryBuffer(&vtx_buffer_info, vtx_buffer_size, alignof(ImDrawVert))) {
                     fprintf(stderr, "Failed to allocate vertex buffer for ImGui\n");
                     continue;
                 }
 
-                if (!vulkan->AllocateTemporary(&idx_buffer_info, idx_buffer_size, alignof(ImDrawIdx))) {
+                if (!vulkan->GetTemporaryBuffer(&idx_buffer_info, idx_buffer_size, alignof(ImDrawIdx))) {
                     fprintf(stderr, "Failed to allocate index buffer for ImGui\n");
                     continue;
                 }
 
                 if (use_memcpy) {
-                    std::memcpy(vtx_buffer_info.mapped, cmd_list->VtxBuffer.Data, vtx_buffer_size);
-                    std::memcpy(idx_buffer_info.mapped, cmd_list->IdxBuffer.Data, idx_buffer_size);
+                    std::memcpy(vtx_buffer_info.allocation.mapped, cmd_list->VtxBuffer.Data, vtx_buffer_size);
+                    std::memcpy(idx_buffer_info.allocation.mapped, cmd_list->IdxBuffer.Data, idx_buffer_size);
                 } else {
-                    UpdateBuffer(cmd, &vtx_buffer_info, cmd_list->VtxBuffer.Data, vtx_buffer_size);
-                    UpdateBuffer(cmd, &idx_buffer_info, cmd_list->IdxBuffer.Data, idx_buffer_size);
+                    gpu_update_buffer(cmd, &vtx_buffer_info, cmd_list->VtxBuffer.Data, vtx_buffer_size);
+                    gpu_update_buffer(cmd, &idx_buffer_info, cmd_list->IdxBuffer.Data, idx_buffer_size);
                 }
 
                 auto viewport_scale = ImGui::GetIO().DisplayFramebufferScale;
@@ -287,7 +260,7 @@ struct App {
                     .setDstAccessMask(vk::AccessFlagBits2::eShaderRead)
                     .setOldLayout(vk::ImageLayout::eGeneral)
                     .setNewLayout(vk::ImageLayout::eShaderReadOnlyOptimal)
-                    .setImage(vulkan->color_textures[vulkan->image_index].image)
+                    .setImage(color_texture.image)
                     .setSubresourceRange(vk::ImageSubresourceRange(vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1)),
             };
 
@@ -309,9 +282,10 @@ struct App {
             vk::ClearValue(vk::ClearColorValue(std::array{0.0f, 0.0f, 0.0f, 1.0f})),
         };
 
+
         auto render_pass_begin_info = vk::RenderPassBeginInfo()
             .setRenderPass(vulkan->swapchain_render_pass)
-            .setFramebuffer(vulkan->swapchain_framebuffers[vulkan->image_index])
+            .setFramebuffer(vulkan->swapchain_framebuffers[vulkan->current_image_index])
             .setRenderArea(render_area)
             .setClearValues(clear_values);
 
@@ -319,45 +293,77 @@ struct App {
         cmd.setViewport(0, render_viewport);
         cmd.setScissor(0, render_area);
 
-        cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, graphics_pipeline_state.pipeline);
+//        auto bind_group = vulkan->GetTemporaryBindGroup(graphics_bind_group_layout);
+//        {
+//            auto image_info = vk::DescriptorImageInfo()
+//                .setSampler(color_texture.sampler)
+//                .setImageView(color_texture.view)
+//                .setImageLayout(vk::ImageLayout::eShaderReadOnlyOptimal);
+//
+//            auto writes = std::array{
+//                vk::WriteDescriptorSet()
+//                    .setDstSet(bind_group)
+//                    .setDstBinding(0)
+//                    .setDstArrayElement(0)
+//                    .setDescriptorType(vk::DescriptorType::eCombinedImageSampler)
+//                    .setDescriptorCount(1)
+//                    .setPImageInfo(&image_info)
+//            };
+//
+//            vulkan->context.logical_device.updateDescriptorSets(writes, nullptr);
+//        }
+//        cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, graphics_pipeline_state.pipeline);
+//        cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, graphics_pipeline_state.pipeline_layout, 0, 1, &bind_group, 0, nullptr);
+//        cmd.draw(6, 1, 0, 0);
 
-        vk::DescriptorSet bind_group;
-        {
-            auto allocate_info = vk::DescriptorSetAllocateInfo()
-                .setDescriptorPool(vulkan->bind_group_allocators[vulkan->frame_index])
-                .setDescriptorSetCount(1)
-                .setPSetLayouts(&graphics_bind_group_layout);
-
-            auto result = vulkan->context.logical_device.allocateDescriptorSets(&allocate_info, &bind_group);
-            if (result != vk::Result::eSuccess) {
-                fprintf(stderr, "Failed to allocate descriptor set %s\n", vk::to_string(result).c_str());
-                exit(1);
-            }
-
-            auto image_info = vk::DescriptorImageInfo()
-                .setSampler(vulkan->color_textures[vulkan->image_index].sampler)
-                .setImageView(vulkan->color_textures[vulkan->image_index].view)
-                .setImageLayout(vk::ImageLayout::eShaderReadOnlyOptimal);
-
-            auto writes = std::array{
-                vk::WriteDescriptorSet()
-                    .setDstSet(bind_group)
-                    .setDstBinding(0)
-                    .setDstArrayElement(0)
-                    .setDescriptorType(vk::DescriptorType::eCombinedImageSampler)
-                    .setDescriptorCount(1)
-                    .setPImageInfo(&image_info)
-            };
-
-            vulkan->context.logical_device.updateDescriptorSets(writes, nullptr);
-        }
-        cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, graphics_pipeline_state.pipeline_layout, 0, 1, &bind_group, 0, nullptr);
-
-        cmd.draw(6, 1, 0, 0);
-
-//        imgui->RenderDrawData(cmd, ImGui::GetDrawData());
+        imgui->RecordCommandBuffer(cmd, ImGui::GetDrawData());
 
         cmd.endRenderPass();
+    }
+
+    void CreateRenderTargets() {
+        auto color_image_info = vk::ImageCreateInfo()
+            .setImageType(vk::ImageType::e2D)
+            .setFormat(vk::Format::eR32G32B32A32Sfloat)
+            .setExtent(vk::Extent3D(vulkan->configuration.extent.width, vulkan->configuration.extent.height, 1))
+            .setMipLevels(1)
+            .setArrayLayers(1)
+            .setSamples(vk::SampleCountFlagBits::e1)
+            .setTiling(vk::ImageTiling::eOptimal)
+            .setUsage(vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eTransferDst)
+            .setSharingMode(vk::SharingMode::eExclusive)
+            .setQueueFamilyIndices({})
+            .setInitialLayout(vk::ImageLayout::eUndefined);
+
+        vk::resultCheck(vulkan->context.logical_device.createImage(&color_image_info, nullptr, &color_texture.image), "Failed to create image");
+        gpu_texture_storage(&vulkan->context, &color_texture.allocation, color_texture.image, GpuStorageMode::ePrivate, {});
+
+        auto color_view_info = vk::ImageViewCreateInfo()
+            .setImage(color_texture.image)
+            .setViewType(vk::ImageViewType::e2D)
+            .setFormat(vk::Format::eR32G32B32A32Sfloat)
+            .setSubresourceRange(vk::ImageSubresourceRange(vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1));
+
+        vk::resultCheck(vulkan->context.logical_device.createImageView(&color_view_info, nullptr, &color_texture.view), "Failed to create image view");
+        
+        auto color_sampler_info = vk::SamplerCreateInfo()
+            .setMagFilter(vk::Filter::eNearest)
+            .setMinFilter(vk::Filter::eNearest)
+            .setAddressModeU(vk::SamplerAddressMode::eClampToEdge)
+            .setAddressModeV(vk::SamplerAddressMode::eClampToEdge)
+            .setAddressModeW(vk::SamplerAddressMode::eClampToEdge)
+            .setAnisotropyEnable(false)
+            .setMaxAnisotropy(1.0f)
+            .setBorderColor(vk::BorderColor::eFloatOpaqueWhite)
+            .setUnnormalizedCoordinates(false)
+            .setCompareEnable(false)
+            .setCompareOp(vk::CompareOp::eAlways)
+            .setMipmapMode(vk::SamplerMipmapMode::eNearest)
+            .setMipLodBias(0.0f)
+            .setMinLod(0.0f)
+            .setMaxLod(0.0f);
+        
+        vk::resultCheck(vulkan->context.logical_device.createSampler(&color_sampler_info, nullptr, &color_texture.sampler), "Failed to create sampler");
     }
 
     void CreateComputePipelineState() {

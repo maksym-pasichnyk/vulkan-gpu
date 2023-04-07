@@ -7,14 +7,19 @@
 #define VK_NO_PROTOTYPES
 #define VK_ENABLE_BETA_EXTENSIONS
 
-#include "numeric.hpp"
-
-#include <GLFW/glfw3.h>
 #include <vulkan/vulkan.hpp>
-//#include <SDL_vulkan.h>
+
+#include "WindowPlatform.hpp"
 
 template<typename T>
 using Slice = vk::ArrayProxyNoTemporaries<T>;
+
+enum class GpuStorageMode {
+    ePrivate,
+    eManaged,
+    eShared,
+    eLazy,
+};
 
 struct GpuInputAssemblyState {
     vk::PrimitiveTopology   topology                    = vk::PrimitiveTopology::eTriangleList;
@@ -67,7 +72,6 @@ struct GpuAllocation {
 
 struct GpuBufferInfo {
     vk::Buffer          buffer          = {};
-    void*               mapped          = {};
     vk::DeviceSize      size            = {};
     vk::DeviceSize      offset          = {};
     GpuAllocation       allocation      = {};
@@ -121,6 +125,10 @@ struct GpuLinearAllocator {
     vk::DeviceAddress   device_address;
 };
 
+struct GpuShaderObject {
+
+};
+
 struct GpuContext {
     vk::Instance                    instance;
     vk::SurfaceKHR                  surface;
@@ -165,7 +173,30 @@ auto gpu_find_memory_type_index(GpuContext* context, u32 memory_type_bits, vk::M
     return std::numeric_limits<u32>::max();
 }
 
-void gpu_allocate_memory(GpuContext* context, GpuAllocation* allocation, vk::MemoryRequirements memory_requirements, vk::MemoryPropertyFlags memory_property_flags, vk::MemoryAllocateFlags memory_allocate_flags) {
+void gpu_allocate_memory(GpuContext* context, GpuAllocation* allocation, vk::MemoryRequirements memory_requirements, GpuStorageMode gpu_storage_mode, vk::MemoryAllocateFlags memory_allocate_flags) {
+    vk::MemoryPropertyFlags memory_property_flags = {};
+    switch (gpu_storage_mode) {
+        case GpuStorageMode::ePrivate: {
+            memory_property_flags |= vk::MemoryPropertyFlagBits::eDeviceLocal;
+            break;
+        }
+        case GpuStorageMode::eManaged: {
+            memory_property_flags |= vk::MemoryPropertyFlagBits::eHostVisible;
+            memory_property_flags |= vk::MemoryPropertyFlagBits::eHostCached;
+            break;
+        }
+        case GpuStorageMode::eShared: {
+            memory_property_flags |= vk::MemoryPropertyFlagBits::eHostVisible;
+            memory_property_flags |= vk::MemoryPropertyFlagBits::eHostCoherent;
+            break;
+        }
+        case GpuStorageMode::eLazy: {
+            memory_property_flags |= vk::MemoryPropertyFlagBits::eDeviceLocal;
+            memory_property_flags |= vk::MemoryPropertyFlagBits::eLazilyAllocated;
+            break;
+        }
+    }
+
     auto memory_type_index = gpu_find_memory_type_index(context, memory_requirements.memoryTypeBits, memory_property_flags);
 
     auto memory_allocate_flags_info = vk::MemoryAllocateFlagsInfo()
@@ -185,6 +216,18 @@ void gpu_allocate_memory(GpuContext* context, GpuAllocation* allocation, vk::Mem
     } else {
         allocation->mapped = nullptr;
     }
+}
+
+void gpu_buffer_storage(GpuContext* context, GpuAllocation* allocation, vk::Buffer buffer, GpuStorageMode gpu_storage_mode, vk::MemoryAllocateFlags memory_allocate_flags) {
+    auto memory_requirements = context->logical_device.getBufferMemoryRequirements(buffer);
+    gpu_allocate_memory(context, allocation, memory_requirements, gpu_storage_mode, memory_allocate_flags);
+    context->logical_device.bindBufferMemory(buffer, allocation->device_memory, 0);
+}
+
+void gpu_texture_storage(GpuContext* context, GpuAllocation* allocation, vk::Image image, GpuStorageMode gpu_storage_mode, vk::MemoryAllocateFlags memory_allocate_flags) {
+    auto memory_requirements = context->logical_device.getImageMemoryRequirements(image);
+    gpu_allocate_memory(context, allocation, memory_requirements, gpu_storage_mode, memory_allocate_flags);
+    context->logical_device.bindImageMemory(image, allocation->device_memory, 0);
 }
 
 void gpu_free_memory(GpuContext* context, GpuAllocation* allocation) {
@@ -221,11 +264,7 @@ void gpu_create_allocator(GpuContext* context, GpuLinearAllocator* allocator, vk
 
     auto memory_requirements = context->logical_device.getBufferMemoryRequirements(allocator->buffer);
 
-    vk::MemoryPropertyFlags memory_property_flags = {};
-    memory_property_flags |= vk::MemoryPropertyFlagBits::eHostVisible;
-    memory_property_flags |= vk::MemoryPropertyFlagBits::eHostCoherent;
-
-    gpu_allocate_memory(context, &allocator->allocation, memory_requirements, memory_property_flags, memory_allocate_flags);
+    gpu_allocate_memory(context, &allocator->allocation, memory_requirements, GpuStorageMode::eShared, memory_allocate_flags);
     context->logical_device.bindBufferMemory(allocator->buffer, allocator->allocation.device_memory, 0);
 
     auto buffer_device_address_info = vk::BufferDeviceAddressInfo().setBuffer(allocator->buffer);
@@ -237,7 +276,7 @@ void gpu_destroy_allocator(GpuContext* context, GpuLinearAllocator* allocator) {
     gpu_free_memory(context, &allocator->allocation);
 }
 
-void gpu_create_context(GpuContext* context, GLFWwindow* window, PFN_vkGetInstanceProcAddr vk_get_instance_proc_addr) {
+void gpu_create_context(GpuContext* context, WindowPlatform* platform, PFN_vkGetInstanceProcAddr vk_get_instance_proc_addr) {
     vk::defaultDispatchLoaderDynamic.init(vk_get_instance_proc_addr);
 
     std::vector<const char*> instance_extensions;
@@ -296,12 +335,7 @@ void gpu_create_context(GpuContext* context, GLFWwindow* window, PFN_vkGetInstan
 
     context->messenger = context->instance.createDebugUtilsMessengerEXT(messenger_create_info);
 
-    VkResult result = glfwCreateWindowSurface(context->instance, window, nullptr, reinterpret_cast<VkSurfaceKHR*>(&context->surface));
-    if (result != VK_SUCCESS) {
-        fprintf(stderr, "Failed to create window surface: %s\n", vk::to_string(static_cast<vk::Result>(result)).c_str());
-        exit(1);
-    }
-//    SDL_Vulkan_CreateSurface(window, context->instance, reinterpret_cast<VkSurfaceKHR*>(&context->surface));
+    vk::resultCheck(platform->CreateWindowSurface(context->instance, &context->surface), "Failed to create window surface");
 
     context->physical_device = context->instance.enumeratePhysicalDevices().front();
 
@@ -396,10 +430,10 @@ auto gpu_allocator_allocate(GpuLinearAllocator* allocator, GpuBufferInfo* info, 
         return false;
     }
     info->buffer            = allocator->buffer;
-    info->mapped            = reinterpret_cast<u8*>(allocator->allocation.mapped) + aligned_offset;
     info->size              = size;
     info->offset            = aligned_offset;
     info->allocation        = allocator->allocation;
+    info->allocation.mapped = reinterpret_cast<u8*>(allocator->allocation.mapped) + aligned_offset;
     info->device_address    = allocator->device_address + aligned_offset;
 
     allocator->offset       = aligned_offset + size;
@@ -504,7 +538,7 @@ void gpu_create_graphics_pipeline_state(GpuContext* context, GpuGraphicsPipeline
         .setBasePipelineHandle(nullptr)
         .setBasePipelineIndex(-1);
 
-    context->logical_device.createGraphicsPipelines(nullptr, 1, &graphics_pipeline_create_info, nullptr, &state->pipeline);
+    vk::resultCheck(context->logical_device.createGraphicsPipelines(nullptr, 1, &graphics_pipeline_create_info, nullptr, &state->pipeline), "Failed to create graphics pipeline");
 }
 
 void gpu_destroy_graphics_pipeline_state(GpuContext* context, GpuGraphicsPipelineState* state) {
@@ -530,10 +564,26 @@ void gpu_create_compute_pipeline_state(GpuContext* context, GpuComputePipelineSt
         .setBasePipelineHandle(nullptr)
         .setBasePipelineIndex(-1);
 
-    context->logical_device.createComputePipelines(nullptr, 1, &compute_pipeline_create_info, nullptr, &state->pipeline);
+    vk::resultCheck(context->logical_device.createComputePipelines(nullptr, 1, &compute_pipeline_create_info, nullptr, &state->pipeline), "Failed to create compute pipeline");
 }
 
 void gpu_destroy_compute_pipeline_state(GpuContext* context, GpuComputePipelineState* state) {
     context->logical_device.destroyPipeline(state->pipeline);
     context->logical_device.destroyPipelineLayout(state->pipeline_layout);
+}
+
+void gpu_update_buffer(vk::CommandBuffer cmd, GpuBufferInfo* info, void* src, vk::DeviceSize size) {
+    vk::DeviceSize max_data_size = 65536;
+    vk::DeviceSize remaining = size;
+    vk::DeviceSize offset = 0;
+
+    while (remaining > max_data_size) {
+        cmd.updateBuffer(info->buffer, info->offset + offset, max_data_size, reinterpret_cast<u8*>(src) + offset);
+        remaining -= max_data_size;
+        offset += max_data_size;
+    }
+
+    if (remaining > 0) {
+        cmd.updateBuffer(info->buffer, info->offset + offset, remaining, reinterpret_cast<u8*>(src) + offset);
+    }
 }

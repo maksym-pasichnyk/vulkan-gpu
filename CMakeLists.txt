@@ -4,7 +4,6 @@ include(FetchContent)
 
 set(CMAKE_CXX_STANDARD 23)
 
-# find_package(SDL2 REQUIRED)
 find_package(Vulkan REQUIRED)
 
 FetchContent_Declare(glfw GIT_REPOSITORY https://github.com/glfw/glfw.git)
@@ -19,8 +18,9 @@ target_include_directories(imgui PUBLIC "${imgui_SOURCE_DIR}")
 target_compile_definitions(imgui PUBLIC -DIMGUI_DEFINE_MATH_OPERATORS)
 target_compile_definitions(imgui PUBLIC -DIMGUI_USER_CONFIG=<${CMAKE_CURRENT_SOURCE_DIR}/src/imgui_config_override.hpp>)
 
-add_executable(game src/main.cpp src/numeric.hpp src/enum.hpp src/result.hpp src/gpu.hpp src/VulkanRenderer.hpp src/ImGuiRenderer.hpp src/imgui_config_override.hpp)
-target_link_libraries(game PUBLIC #[[SDL2::SDL2]] Vulkan::Vulkan imgui glfw)
+add_executable(game src/pch.hpp src/main.cpp src/enum.hpp src/result.hpp src/gpu.hpp src/VulkanRenderer.hpp src/ImGuiRenderer.hpp src/imgui_config_override.hpp src/ManagedObject.hpp src/WindowPlatform.hpp)
+target_precompile_headers(game PUBLIC src/pch.hpp)
+target_link_libraries(game PUBLIC Vulkan::Vulkan imgui glfw)
 target_compile_definitions(game PUBLIC -DGLFW_INCLUDE_NONE -DGLFW_INCLUDE_VULKAN)
 
 function(target_compile_shaders TARGET_NAME)

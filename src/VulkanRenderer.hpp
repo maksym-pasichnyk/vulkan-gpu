@@ -6,8 +6,8 @@
 
 #include "gpu.hpp"
 #include "result.hpp"
-
-#include <fstream>
+#include "ManagedObject.hpp"
+#include "WindowPlatform.hpp"
 
 struct SurfaceConfiguration {
     vk::Extent2D        extent          = {};
@@ -17,7 +17,8 @@ struct SurfaceConfiguration {
     u32                 min_image_count = {};
 };
 
-struct VulkanRenderer {
+class VulkanRenderer : public ManagedObject {
+public:
     i32 max_frames_in_flight = 3;
 
     vk::DynamicLoader                           loader;
@@ -32,22 +33,22 @@ struct VulkanRenderer {
     vk::RenderPass                              swapchain_render_pass;
     std::vector<vk::Framebuffer>                swapchain_framebuffers;
 
-    std::vector<GpuTexture>                     color_textures;
-
     std::vector<vk::Fence>                      in_flight_fences;
     std::vector<vk::Semaphore>                  image_available_semaphores;
     std::vector<vk::Semaphore>                  render_finished_semaphores;
 
-    vk::CommandPool                             command_pool;
-    std::vector<vk::CommandBuffer>              command_buffers;
+    std::vector<vk::CommandPool>                command_pools;
     std::vector<GpuLinearAllocator>             frame_allocators;
     std::vector<vk::DescriptorPool>             bind_group_allocators;
 
-    u32                                         image_index = 0;
-    usize                                       frame_index = 0;
+    u32                                         current_image_index = 0;
+    usize                                       current_frame_index = 0;
 
-    VulkanRenderer(GLFWwindow* window) {
-        gpu_create_context(&context, window, loader.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr"));
+    vk::CommandBuffer                           current_command_buffer = {};
+
+public:
+    VulkanRenderer(WindowPlatform* platform) {
+        gpu_create_context(&context, platform, loader.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr"));
 
         configuration.format = vk::Format::eB8G8R8A8Unorm;
         configuration.color_space = vk::ColorSpaceKHR::eSrgbNonlinear;
@@ -105,7 +106,7 @@ struct VulkanRenderer {
         CreateDeviceResources();
     }
 
-    ~VulkanRenderer() {
+    ~VulkanRenderer() override {
         CleanupDeviceResources();
         CleanupSwapchain();
 
@@ -114,18 +115,7 @@ struct VulkanRenderer {
     }
 
     void CreateDeviceResources() {
-        auto command_pool_create_info = vk::CommandPoolCreateInfo()
-            .setQueueFamilyIndex(context.graphics_queue_family_index)
-            .setFlags(vk::CommandPoolCreateFlagBits::eResetCommandBuffer);
-
-        command_pool = context.logical_device.createCommandPool(command_pool_create_info);
-
-        auto command_buffer_allocate_info = vk::CommandBufferAllocateInfo()
-            .setCommandPool(command_pool)
-            .setLevel(vk::CommandBufferLevel::ePrimary)
-            .setCommandBufferCount(max_frames_in_flight);
-        command_buffers = context.logical_device.allocateCommandBuffers(command_buffer_allocate_info);
-
+        command_pools.resize(max_frames_in_flight);
         frame_allocators.resize(max_frames_in_flight);
         bind_group_allocators.resize(max_frames_in_flight);
 
@@ -134,21 +124,27 @@ struct VulkanRenderer {
         render_finished_semaphores.resize(max_frames_in_flight);
 
         auto pool_sizes = std::array{
-            vk::DescriptorPoolSize{vk::DescriptorType::eSampler                  , 1024},
-            vk::DescriptorPoolSize{vk::DescriptorType::eSampledImage             , 1024},
-            vk::DescriptorPoolSize{vk::DescriptorType::eCombinedImageSampler     , 1024},
-            vk::DescriptorPoolSize{vk::DescriptorType::eStorageImage             , 1024},
-            vk::DescriptorPoolSize{vk::DescriptorType::eUniformTexelBuffer       , 1024},
-            vk::DescriptorPoolSize{vk::DescriptorType::eStorageTexelBuffer       , 1024},
-            vk::DescriptorPoolSize{vk::DescriptorType::eUniformBuffer            , 1024},
-            vk::DescriptorPoolSize{vk::DescriptorType::eStorageBuffer            , 1024},
-            vk::DescriptorPoolSize{vk::DescriptorType::eUniformBufferDynamic     , 1024},
-            vk::DescriptorPoolSize{vk::DescriptorType::eStorageBufferDynamic     , 1024}
+            vk::DescriptorPoolSize{vk::DescriptorType::eSampler, 1024},
+            vk::DescriptorPoolSize{vk::DescriptorType::eSampledImage, 1024},
+            vk::DescriptorPoolSize{vk::DescriptorType::eCombinedImageSampler, 1024},
+            vk::DescriptorPoolSize{vk::DescriptorType::eStorageImage, 1024},
+            vk::DescriptorPoolSize{vk::DescriptorType::eUniformTexelBuffer, 1024},
+            vk::DescriptorPoolSize{vk::DescriptorType::eStorageTexelBuffer, 1024},
+            vk::DescriptorPoolSize{vk::DescriptorType::eUniformBuffer, 1024},
+            vk::DescriptorPoolSize{vk::DescriptorType::eStorageBuffer, 1024},
+            vk::DescriptorPoolSize{vk::DescriptorType::eUniformBufferDynamic, 1024},
+            vk::DescriptorPoolSize{vk::DescriptorType::eStorageBufferDynamic, 1024}
         };
 
+        vk::CommandPoolCreateInfo command_pool_create_info = {};
+        command_pool_create_info.setQueueFamilyIndex(context.graphics_queue_family_index);
+        command_pool_create_info.setFlags(vk::CommandPoolCreateFlagBits::eResetCommandBuffer);
+
         for (size_t i = 0; i < max_frames_in_flight; i++) {
-            gpu_create_allocator(&context, &frame_allocators[i], 5 * 1024 * 1024);
-            bind_group_allocators[i] = context.logical_device.createDescriptorPool(vk::DescriptorPoolCreateInfo({}, 1000, pool_sizes));
+            gpu_create_allocator(&context, &frame_allocators[i], 5ull * 1024ull * 1024ull);
+
+            command_pools[i] = context.logical_device.createCommandPool(command_pool_create_info);
+            bind_group_allocators[i] = context.logical_device.createDescriptorPool(vk::DescriptorPoolCreateInfo({}, 1024, pool_sizes));
 
             in_flight_fences[i] = context.logical_device.createFence(vk::FenceCreateInfo(vk::FenceCreateFlagBits::eSignaled));
             image_available_semaphores[i] = context.logical_device.createSemaphore(vk::SemaphoreCreateInfo());
@@ -159,13 +155,14 @@ struct VulkanRenderer {
     void CleanupDeviceResources() {
         for (size_t i = 0; i < max_frames_in_flight; i++) {
             gpu_destroy_allocator(&context, &frame_allocators[i]);
+
+            context.logical_device.destroyCommandPool(command_pools[i]);
             context.logical_device.destroyDescriptorPool(bind_group_allocators[i]);
+
             context.logical_device.destroyFence(in_flight_fences[i]);
             context.logical_device.destroySemaphore(image_available_semaphores[i]);
             context.logical_device.destroySemaphore(render_finished_semaphores[i]);
         }
-        context.logical_device.freeCommandBuffers(command_pool, command_buffers);
-        context.logical_device.destroyCommandPool(command_pool);
     }
 
     void ConfigureSwapchain() {
@@ -204,85 +201,14 @@ struct VulkanRenderer {
         swapchain_views.resize(swapchain_images.size());
         swapchain_framebuffers.resize(swapchain_images.size());
 
-        color_textures.resize(swapchain_images.size());
-
         for (size_t i = 0; i < swapchain_images.size(); i++) {
-            auto color_image_create_info = vk::ImageCreateInfo()
-                .setImageType(vk::ImageType::e2D)
-                .setFormat(configuration.format)
-                .setExtent(vk::Extent3D(configuration.extent.width, configuration.extent.height, 1))
-                .setMipLevels(1)
-                .setArrayLayers(1)
-                .setSamples(vk::SampleCountFlagBits::e1)
-                .setTiling(vk::ImageTiling::eOptimal)
-                .setUsage(vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eTransferDst)
-                .setSharingMode(vk::SharingMode::eExclusive)
-                .setQueueFamilyIndices({})
-                .setInitialLayout(vk::ImageLayout::eUndefined);
+            vk::ImageViewCreateInfo image_view_info = {};
+            image_view_info.setImage(swapchain_images[i]);
+            image_view_info.setViewType(vk::ImageViewType::e2D);
+            image_view_info.setFormat(configuration.format);
+            image_view_info.setSubresourceRange(vk::ImageSubresourceRange(vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1));
 
-            color_textures[i].image = context.logical_device.createImage(color_image_create_info);;
-
-            gpu_allocate_memory(
-                &context,
-                &color_textures[i].allocation,
-                context.logical_device.getImageMemoryRequirements(color_textures[i].image),
-                vk::MemoryPropertyFlagBits::eDeviceLocal,
-                vk::MemoryAllocateFlagBits{}
-            );
-            context.logical_device.bindImageMemory(color_textures[i].image, color_textures[i].allocation.device_memory, 0);
-
-            auto color_view_create_info = vk::ImageViewCreateInfo()
-                .setImage(color_textures[i].image)
-                .setViewType(vk::ImageViewType::e2D)
-                .setFormat(configuration.format)
-                .setComponents(vk::ComponentMapping()
-                    .setR(vk::ComponentSwizzle::eIdentity)
-                    .setG(vk::ComponentSwizzle::eIdentity)
-                    .setB(vk::ComponentSwizzle::eIdentity)
-                    .setA(vk::ComponentSwizzle::eIdentity))
-                .setSubresourceRange(vk::ImageSubresourceRange()
-                    .setAspectMask(vk::ImageAspectFlagBits::eColor)
-                    .setBaseMipLevel(0)
-                    .setLevelCount(1)
-                    .setBaseArrayLayer(0)
-                    .setLayerCount(1));
-
-            color_textures[i].view = context.logical_device.createImageView(color_view_create_info);
-            color_textures[i].sampler = context.logical_device.createSampler(vk::SamplerCreateInfo()
-                .setMagFilter(vk::Filter::eNearest)
-                .setMinFilter(vk::Filter::eNearest)
-                .setAddressModeU(vk::SamplerAddressMode::eClampToEdge)
-                .setAddressModeV(vk::SamplerAddressMode::eClampToEdge)
-                .setAddressModeW(vk::SamplerAddressMode::eClampToEdge)
-                .setAnisotropyEnable(false)
-                .setMaxAnisotropy(1.0f)
-                .setBorderColor(vk::BorderColor::eFloatOpaqueWhite)
-                .setUnnormalizedCoordinates(false)
-                .setCompareEnable(false)
-                .setCompareOp(vk::CompareOp::eAlways)
-                .setMipmapMode(vk::SamplerMipmapMode::eNearest)
-                .setMipLodBias(0.0f)
-                .setMinLod(0.0f)
-                .setMaxLod(0.0f)
-            );
-
-            auto swapchain_view_create_info = vk::ImageViewCreateInfo()
-                .setImage(swapchain_images[i])
-                .setViewType(vk::ImageViewType::e2D)
-                .setFormat(configuration.format)
-                .setComponents(vk::ComponentMapping()
-                    .setR(vk::ComponentSwizzle::eIdentity)
-                    .setG(vk::ComponentSwizzle::eIdentity)
-                    .setB(vk::ComponentSwizzle::eIdentity)
-                    .setA(vk::ComponentSwizzle::eIdentity))
-                .setSubresourceRange(vk::ImageSubresourceRange()
-                    .setAspectMask(vk::ImageAspectFlagBits::eColor)
-                    .setBaseMipLevel(0)
-                    .setLevelCount(1)
-                    .setBaseArrayLayer(0)
-                    .setLayerCount(1));
-
-            swapchain_views[i] = context.logical_device.createImageView(swapchain_view_create_info);
+            vk::resultCheck(context.logical_device.createImageView(&image_view_info, nullptr, &swapchain_views[i]), "Failed to create image view");
 
             auto attachments = std::array{
                 swapchain_views[i]
@@ -301,8 +227,6 @@ struct VulkanRenderer {
 
     void CleanupSwapchain() {
         for (size_t i = 0; i < swapchain_images.size(); i++) {
-            CleanupTexture(&color_textures[i]);
-
             context.logical_device.destroyImageView(swapchain_views[i]);
             context.logical_device.destroyFramebuffer(swapchain_framebuffers[i]);
         }
@@ -317,21 +241,30 @@ struct VulkanRenderer {
     }
 
     void WaitAndBeginNewFrame() {
-        vk::resultCheck(context.logical_device.waitForFences(in_flight_fences[frame_index], VK_TRUE, UINT64_MAX), "Failed to wait for fence");
+        vk::resultCheck(context.logical_device.waitForFences(in_flight_fences[current_frame_index], VK_TRUE, UINT64_MAX), "Failed to wait for fence");
 
-        auto result = context.logical_device.acquireNextImageKHR(swapchain, UINT64_MAX, image_available_semaphores[frame_index], nullptr, &image_index);
+        auto result = context.logical_device.acquireNextImageKHR(swapchain, UINT64_MAX, image_available_semaphores[current_frame_index], nullptr, &current_image_index);
         if (result != vk::Result::eErrorOutOfDateKHR && result != vk::Result::eSuboptimalKHR) {
             vk::resultCheck(result, "Failed to acquire swapchain image");
         }
 
-        gpu_allocator_reset(&frame_allocators[frame_index]);
+        gpu_allocator_reset(&frame_allocators[current_frame_index]);
 
-        context.logical_device.resetDescriptorPool(bind_group_allocators[frame_index]);
-        command_buffers[frame_index].begin(vk::CommandBufferBeginInfo(vk::CommandBufferUsageFlagBits::eOneTimeSubmit));
+        context.logical_device.resetCommandPool(command_pools[current_frame_index], {});
+        context.logical_device.resetDescriptorPool(bind_group_allocators[current_frame_index]);
+
+        vk::CommandBufferAllocateInfo command_buffer_allocate_info = {};
+        command_buffer_allocate_info.setCommandPool(command_pools[current_frame_index]);
+        command_buffer_allocate_info.setLevel(vk::CommandBufferLevel::ePrimary);
+        command_buffer_allocate_info.setCommandBufferCount(1);
+
+        vk::resultCheck(context.logical_device.allocateCommandBuffers(&command_buffer_allocate_info, &current_command_buffer), "Failed to allocate command buffers.");
+
+        current_command_buffer.begin(vk::CommandBufferBeginInfo(vk::CommandBufferUsageFlagBits::eOneTimeSubmit));
     }
 
     void SubmitFrameAndPresent() {
-        command_buffers[frame_index].end();
+        current_command_buffer.end();
 
         auto wait_stages = std::array{
             vk::PipelineStageFlags(vk::PipelineStageFlagBits::eColorAttachmentOutput)
@@ -339,35 +272,44 @@ struct VulkanRenderer {
 
         auto submit_info = vk::SubmitInfo()
             .setWaitSemaphoreCount(1)
-            .setPWaitSemaphores(&image_available_semaphores[frame_index])
+            .setPWaitSemaphores(&image_available_semaphores[current_frame_index])
             .setPWaitDstStageMask(wait_stages.data())
             .setCommandBufferCount(1)
-            .setPCommandBuffers(&command_buffers[frame_index])
+            .setPCommandBuffers(&current_command_buffer)
             .setSignalSemaphoreCount(1)
-            .setPSignalSemaphores(&render_finished_semaphores[frame_index]);
+            .setPSignalSemaphores(&render_finished_semaphores[current_frame_index]);
 
-        context.logical_device.resetFences(in_flight_fences[frame_index]);
-        context.graphics_queue.submit(submit_info, in_flight_fences[frame_index]);
+        context.logical_device.resetFences(in_flight_fences[current_frame_index]);
+        context.graphics_queue.submit(submit_info, in_flight_fences[current_frame_index]);
 
         auto present_info = vk::PresentInfoKHR()
             .setWaitSemaphoreCount(1)
-            .setPWaitSemaphores(&render_finished_semaphores[frame_index])
+            .setPWaitSemaphores(&render_finished_semaphores[current_frame_index])
             .setSwapchainCount(1)
             .setPSwapchains(&swapchain)
-            .setPImageIndices(&image_index);
+            .setPImageIndices(&current_image_index);
 
         auto result = context.present_queue.presentKHR(present_info);
         if (result != vk::Result::eErrorOutOfDateKHR && result != vk::Result::eSuboptimalKHR) {
             vk::resultCheck(result, "Failed to present swapchain image");
         }
+
+        current_frame_index = (current_frame_index + 1) % max_frames_in_flight;
     }
 
-    void IncrementFrameIndex() {
-        frame_index = (frame_index + 1) % max_frames_in_flight;
+    auto GetTemporaryBuffer(GpuBufferInfo* info, vk::DeviceSize size, vk::DeviceSize alignment) -> bool {
+        return gpu_allocator_allocate(&frame_allocators[current_frame_index], info, size, alignment);
     }
 
-    auto AllocateTemporary(GpuBufferInfo* info, vk::DeviceSize size, vk::DeviceSize alignment) -> bool {
-        return gpu_allocator_allocate(&frame_allocators[frame_index], info, size, alignment);
+    auto GetTemporaryBindGroup(vk::DescriptorSetLayout bind_group_layout) -> vk::DescriptorSet {
+        vk::DescriptorSetAllocateInfo allocate_info = {};
+        allocate_info.setDescriptorPool(bind_group_allocators[current_frame_index]);
+        allocate_info.setDescriptorSetCount(1);
+        allocate_info.setPSetLayouts(&bind_group_layout);
+
+        vk::DescriptorSet bind_group;
+        vk::resultCheck(context.logical_device.allocateDescriptorSets(&allocate_info, &bind_group), "Failed to allocate descriptor set");
+        return bind_group;
     }
 
     auto LoadShaderModule(const std::string& filename) -> Result<vk::ShaderModule, std::runtime_error> {
@@ -378,103 +320,80 @@ struct VulkanRenderer {
 
         std::vector<char> code(std::istreambuf_iterator<char>(file), {});
 
-        auto create_info = vk::ShaderModuleCreateInfo()
-            .setCodeSize(code.size())
-            .setPCode(reinterpret_cast<const u32*>(code.data()));
+        vk::ShaderModuleCreateInfo create_info = {};
+        create_info.setCodeSize(code.size());
+        create_info.setPCode(reinterpret_cast<const u32*>(code.data()));
 
         return context.logical_device.createShaderModule(create_info);
     }
 
     void CreateTextureFromMemory(GpuTexture* texture, u32 width, u32 height, void* pixels) {
-        auto color_image_create_info = vk::ImageCreateInfo()
-            .setImageType(vk::ImageType::e2D)
-            .setFormat(vk::Format::eR8G8B8A8Unorm)
-            .setExtent(vk::Extent3D(width, height, 1))
-            .setMipLevels(1)
-            .setArrayLayers(1)
-            .setSamples(vk::SampleCountFlagBits::e1)
-            .setTiling(vk::ImageTiling::eOptimal)
-            .setUsage(vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferDst)
-            .setSharingMode(vk::SharingMode::eExclusive)
-            .setQueueFamilyIndices({})
-            .setInitialLayout(vk::ImageLayout::eUndefined);
+        vk::ImageCreateInfo image_create_info = {};
+        image_create_info.setImageType(vk::ImageType::e2D);
+        image_create_info.setFormat(vk::Format::eR8G8B8A8Unorm);
+        image_create_info.setExtent(vk::Extent3D(width, height, 1));
+        image_create_info.setMipLevels(1);
+        image_create_info.setArrayLayers(1);
+        image_create_info.setSamples(vk::SampleCountFlagBits::e1);
+        image_create_info.setTiling(vk::ImageTiling::eOptimal);
+        image_create_info.setUsage(vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferDst);
+        image_create_info.setSharingMode(vk::SharingMode::eExclusive);
+        image_create_info.setQueueFamilyIndices({});
+        image_create_info.setInitialLayout(vk::ImageLayout::eUndefined);
 
-        texture->image = context.logical_device.createImage(color_image_create_info);
+        vk::resultCheck(context.logical_device.createImage(&image_create_info, nullptr, &texture->image), "Failed to create image");
 
-        gpu_allocate_memory(
-            &context,
-            &texture->allocation,
-            context.logical_device.getImageMemoryRequirements(texture->image),
-            vk::MemoryPropertyFlagBits::eDeviceLocal,
-            vk::MemoryAllocateFlagBits{}
-        );
-        context.logical_device.bindImageMemory(texture->image, texture->allocation.device_memory, 0);
+        gpu_texture_storage(&context, &texture->allocation, texture->image, GpuStorageMode::ePrivate, {});
 
-        auto color_view_create_info = vk::ImageViewCreateInfo()
-            .setImage(texture->image)
-            .setViewType(vk::ImageViewType::e2D)
-            .setFormat(vk::Format::eR8G8B8A8Unorm)
-            .setComponents(vk::ComponentMapping()
-                .setR(vk::ComponentSwizzle::eIdentity)
-                .setG(vk::ComponentSwizzle::eIdentity)
-                .setB(vk::ComponentSwizzle::eIdentity)
-                .setA(vk::ComponentSwizzle::eIdentity))
-            .setSubresourceRange(vk::ImageSubresourceRange()
-                .setAspectMask(vk::ImageAspectFlagBits::eColor)
-                .setBaseMipLevel(0)
-                .setLevelCount(1)
-                .setBaseArrayLayer(0)
-                .setLayerCount(1));
+        vk::ImageViewCreateInfo view_create_info = {};
+        view_create_info.setImage(texture->image);
+        view_create_info.setViewType(vk::ImageViewType::e2D);
+        view_create_info.setFormat(vk::Format::eR8G8B8A8Unorm);
+        view_create_info.setSubresourceRange(vk::ImageSubresourceRange(vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1));
 
-        texture->view = context.logical_device.createImageView(color_view_create_info);
+        vk::resultCheck(context.logical_device.createImageView(&view_create_info, nullptr, &texture->view), "Failed to create image view");
 
-        texture->sampler = context.logical_device.createSampler(vk::SamplerCreateInfo()
-            .setMagFilter(vk::Filter::eNearest)
-            .setMinFilter(vk::Filter::eNearest)
-            .setAddressModeU(vk::SamplerAddressMode::eClampToEdge)
-            .setAddressModeV(vk::SamplerAddressMode::eClampToEdge)
-            .setAddressModeW(vk::SamplerAddressMode::eClampToEdge)
-            .setAnisotropyEnable(false)
-            .setMaxAnisotropy(1.0f)
-            .setBorderColor(vk::BorderColor::eFloatOpaqueWhite)
-            .setUnnormalizedCoordinates(false)
-            .setCompareEnable(false)
-            .setCompareOp(vk::CompareOp::eAlways)
-            .setMipmapMode(vk::SamplerMipmapMode::eNearest)
-            .setMipLodBias(0.0f)
-            .setMinLod(0.0f)
-            .setMaxLod(0.0f)
-        );
+        vk::SamplerCreateInfo sampler_create_info = {};
+        sampler_create_info.setMagFilter(vk::Filter::eNearest);
+        sampler_create_info.setMinFilter(vk::Filter::eNearest);
+        sampler_create_info.setAddressModeU(vk::SamplerAddressMode::eClampToEdge);
+        sampler_create_info.setAddressModeV(vk::SamplerAddressMode::eClampToEdge);
+        sampler_create_info.setAddressModeW(vk::SamplerAddressMode::eClampToEdge);
+        sampler_create_info.setAnisotropyEnable(false);
+        sampler_create_info.setMaxAnisotropy(1.0f);
+        sampler_create_info.setBorderColor(vk::BorderColor::eFloatOpaqueWhite);
+        sampler_create_info.setUnnormalizedCoordinates(false);
+        sampler_create_info.setCompareEnable(false);
+        sampler_create_info.setCompareOp(vk::CompareOp::eAlways);
+        sampler_create_info.setMipmapMode(vk::SamplerMipmapMode::eNearest);
+        sampler_create_info.setMipLodBias(0.0f);
+        sampler_create_info.setMinLod(0.0f);
+        sampler_create_info.setMaxLod(0.0f);
 
+        vk::resultCheck(context.logical_device.createSampler(&sampler_create_info, nullptr, &texture->sampler), "Failed to create sampler");
+
+//        // TODO: simplify this
+        auto size_in_bytes = static_cast<vk::DeviceSize>(width * height * 4);
         {
-            auto size_in_bytes = static_cast<vk::DeviceSize>(width * height * 4);
 
             auto buffer_create_info = vk::BufferCreateInfo()
                 .setSize(size_in_bytes)
                 .setUsage(vk::BufferUsageFlagBits::eTransferSrc)
-                .setSharingMode(vk::SharingMode::eExclusive)
-                .setQueueFamilyIndices({})
-                .setFlags(vk::BufferCreateFlagBits{});
+                .setSharingMode(vk::SharingMode::eExclusive);
 
-            auto tmp = context.logical_device.createBuffer(buffer_create_info);
+            vk::Buffer tmp_buf;
+            vk::resultCheck(context.logical_device.createBuffer(&buffer_create_info, nullptr, &tmp_buf), "Failed to create buffer");
 
-            GpuAllocation allocation;
-            gpu_allocate_memory(
-                &context,
-                &allocation,
-                context.logical_device.getBufferMemoryRequirements(tmp),
-                vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
-                vk::MemoryAllocateFlagBits{}
-            );
+            GpuAllocation tmp_mem;
+            gpu_buffer_storage(&context, &tmp_mem, tmp_buf, GpuStorageMode::eShared, {});
 
-            context.logical_device.bindBufferMemory(tmp, allocation.device_memory, 0);
+            std::memcpy(tmp_mem.mapped, pixels, size_in_bytes);
 
-            std::memcpy(allocation.mapped, pixels, size_in_bytes);
+            vk::CommandPoolCreateInfo cmd_pool_info = {};
+            cmd_pool_info.setQueueFamilyIndex(context.graphics_queue_family_index);
+            cmd_pool_info.setFlags(vk::CommandPoolCreateFlagBits::eResetCommandBuffer);
 
-            auto cmd_pool = context.logical_device.createCommandPool(vk::CommandPoolCreateInfo()
-                .setQueueFamilyIndex(context.graphics_queue_family_index)
-                .setFlags(vk::CommandPoolCreateFlagBits::eResetCommandBuffer)
-            );
+            auto cmd_pool = context.logical_device.createCommandPool(cmd_pool_info);
 
             auto cmd_allocate_info = vk::CommandBufferAllocateInfo()
                 .setCommandPool(cmd_pool)
@@ -502,11 +421,27 @@ struct VulkanRenderer {
                 cmd.pipelineBarrier2(vk::DependencyInfo({}, {}, {}, barriers));
             }
 
+//            vk::BufferImageCopy2 copy_region = {};
+//            copy_region.setBufferOffset(0);
+//            copy_region.setBufferRowLength(0);
+//            copy_region.setBufferImageHeight(0);
+//            copy_region.setImageOffset(vk::Offset3D(0, 0, 0));
+//            copy_region.setImageExtent(vk::Extent3D(width, height, 1));
+//            copy_region.setImageSubresource(vk::ImageSubresourceLayers(vk::ImageAspectFlagBits::eColor, 0, 0, 1));
+//
+//            vk::CopyBufferToImageInfo2 copy_info = {};
+//            copy_info.dstImage = texture->image;
+//            copy_info.dstImageLayout = vk::ImageLayout::eTransferDstOptimal;
+//            copy_info.regionCount = 1;
+//            copy_info.pRegions = &copy_region;
+//
+//            cmd.copyBufferToImage2(copy_info);
+
             auto region = vk::BufferImageCopy()
                 .setImageSubresource(vk::ImageSubresourceLayers(vk::ImageAspectFlagBits::eColor, 0, 0, 1))
                 .setImageExtent(vk::Extent3D(width, height, 1));
 
-            cmd.copyBufferToImage(tmp, texture->image, vk::ImageLayout::eTransferDstOptimal, 1, &region);
+            cmd.copyBufferToImage(tmp_buf, texture->image, vk::ImageLayout::eTransferDstOptimal, 1, &region);
 
             {
                 auto barriers = std::array{
@@ -529,13 +464,12 @@ struct VulkanRenderer {
             auto fence = context.logical_device.createFence(vk::FenceCreateInfo());
             auto submit_info = vk::SubmitInfo(0, nullptr, nullptr, 1, &cmd, 0, nullptr);
 
-            context.graphics_queue.submit(1, &submit_info, fence);
-            context.logical_device.waitForFences(1, &fence, VK_TRUE, UINT64_MAX);
+            vk::resultCheck(context.graphics_queue.submit(1, &submit_info, fence), "Failed to submit command buffer");
+            vk::resultCheck(context.logical_device.waitForFences(1, &fence, VK_TRUE, UINT64_MAX), "Failed to wait for fence");
             context.logical_device.destroyFence(fence);
-            context.logical_device.destroyBuffer(tmp);
-            gpu_free_memory(&context, &allocation);
+            context.logical_device.destroyBuffer(tmp_buf);
+            gpu_free_memory(&context, &tmp_mem);
 
-            context.logical_device.freeCommandBuffers(cmd_pool, 1, &cmd);
             context.logical_device.destroyCommandPool(cmd_pool);
         }
     }
@@ -544,9 +478,12 @@ struct VulkanRenderer {
         if (texture->sampler) {
             context.logical_device.destroySampler(texture->sampler);
         }
-        context.logical_device.destroyImageView(texture->view);
-        context.logical_device.destroyImage(texture->image);
-
+        if (texture->view) {
+            context.logical_device.destroyImageView(texture->view);
+        }
+        if (texture->image) {
+            context.logical_device.destroyImage(texture->image);
+        }
         gpu_free_memory(&context, &texture->allocation);
     }
 };
